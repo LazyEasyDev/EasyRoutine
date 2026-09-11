@@ -41,7 +41,7 @@ type leaseState struct {
 	SuccessCount int64
 	// FailureCount is the number of task attempts that panicked.
 	FailureCount int64
-	// Log contains panic details when Status is RoutinePanic.
+	// Log starts with the server tag and contains panic details when applicable.
 	Log string
 }
 
@@ -52,23 +52,25 @@ type SupervisorLog struct {
 	Owner  string
 	Action LeaseAction
 	Status RoutineStatus
-	Log    string
-	// CreatedAt is assigned by the provider's storage clock.
-	CreatedAt time.Time
+	// Log starts with the server tag and contains panic details when applicable.
+	Log string
+	// CreatedAt is Unix time in seconds assigned by the provider's storage clock.
+	CreatedAt int64
 }
 
 // SupervisorStatus is the latest state stored for a uniquely supervised task.
 // Owner identifies the last process to hold the lease. ExpiresAt and UpdatedAt
-// are database-generated timestamps for observation.
+// are Unix times in seconds assigned by the database clock.
 type SupervisorStatus struct {
 	Name         string
 	Owner        string
 	Status       RoutineStatus
 	SuccessCount int64
 	FailureCount int64
-	Log          string
-	ExpiresAt    time.Time
-	UpdatedAt    time.Time
+	// Log starts with the server tag and contains panic details when applicable.
+	Log       string
+	ExpiresAt int64
+	UpdatedAt int64
 }
 
 func validateRoutineName(name string) error {

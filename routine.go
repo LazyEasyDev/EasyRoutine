@@ -39,7 +39,8 @@ type Handle struct {
 // SafeGo launches a panic-safe goroutine derived from ctx. Its policy decides
 // whether and when a panicked task is retried. The context, task, and policy
 // are required. Invalid arguments are returned before a goroutine is started.
-// The task and policy must not call runtime.Goexit.
+// The task and policy must not call runtime.Goexit; if either does, managed
+// work stops without treating Goexit as a panic.
 func SafeGo(ctx context.Context, task func(ctx context.Context), policy PanicPolicy) (*Handle, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")

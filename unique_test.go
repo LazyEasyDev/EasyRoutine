@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -276,6 +277,39 @@ func TestUniqueSupervisorUsesInitializedBackend(t *testing.T) {
 	supervisor.Wait()
 }
 
+func TestUniqueSupervisorStopsAfterTaskGoexit(t *testing.T) {
+	backend := &countingLease{released: make(chan struct{}, 1)}
+	configured := &coordinator{
+		backend: backend,
+		timing: leaseTiming{
+			ttl:       time.Second,
+			heartbeat: 10 * time.Millisecond,
+			release:   time.Second,
+		},
+	}
+
+	started := make(chan struct{})
+	var handled atomic.Int32
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+		Run: func(context.Context) {
+			close(started)
+			runtime.Goexit()
+		},
+	}, func(Panic) {
+		handled.Add(1)
+	})
+	waitForSignal(t, started)
+	waitForSignal(t, backend.released)
+	select {
+	case <-supervisor.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor did not stop after task called runtime.Goexit")
+	}
+	if handled.Load() != 0 {
+		t.Fatalf("panic handler calls = %d, want 0", handled.Load())
+	}
+}
+
 func TestUniqueSupervisorReleasesLeaseDuringPanicCooldown(t *testing.T) {
 	backend := &countingLease{released: make(chan struct{}, 1)}
 	configured := &coordinator{
@@ -288,7 +322,7 @@ func TestUniqueSupervisorReleasesLeaseDuringPanicCooldown(t *testing.T) {
 	}
 
 	panicHandlerSawRelease := make(chan bool, 1)
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(context.Context) {
 			panic("retry")
 		},
@@ -297,9 +331,6 @@ func TestUniqueSupervisorReleasesLeaseDuringPanicCooldown(t *testing.T) {
 		panicHandlerSawRelease <- backend.owner == ""
 		backend.mu.Unlock()
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
 		supervisor.Stop()
 		supervisor.Wait()
@@ -336,16 +367,13 @@ func TestUniqueSupervisorReportsLifecycleStateInLeaseActions(t *testing.T) {
 	}
 
 	var attempts atomic.Int32
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(context.Context) {
 			if attempts.Add(1) == 3 {
 				panic("boom")
 			}
 		},
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
 		supervisor.Stop()
 		supervisor.Wait()
@@ -361,8 +389,8 @@ func TestUniqueSupervisorReportsLifecycleStateInLeaseActions(t *testing.T) {
 	if acquired.action != LeaseAcquire || acquired.state.Status != RoutineNotStarted {
 		t.Fatalf("acquire = %#v, want not-started acquire", acquired)
 	}
-	if acquired.state.SuccessCount != 0 || acquired.state.FailureCount != 0 || acquired.state.Log != "" {
-		t.Fatalf("initial state = %#v, want zero counters and empty log", acquired.state)
+	if acquired.state.SuccessCount != 0 || acquired.state.FailureCount != 0 || acquired.state.Log != serverLog("") {
+		t.Fatalf("initial state = %#v, want zero counters and server tag log", acquired.state)
 	}
 	released := actions[1]
 	if released.action != LeaseRelease || released.state.Status != RoutinePanic {
@@ -371,7 +399,7 @@ func TestUniqueSupervisorReportsLifecycleStateInLeaseActions(t *testing.T) {
 	if released.state.SuccessCount != 2 || released.state.FailureCount != 1 {
 		t.Fatalf("panic counters = (%d, %d), want (2, 1)", released.state.SuccessCount, released.state.FailureCount)
 	}
-	if !strings.Contains(released.state.Log, "boom") || !strings.Contains(released.state.Log, "TestUniqueSupervisorReportsLifecycleStateInLeaseActions") {
+	if !strings.HasPrefix(released.state.Log, serverLog("")+"\n") || !strings.Contains(released.state.Log, "boom") || !strings.Contains(released.state.Log, "TestUniqueSupervisorReportsLifecycleStateInLeaseActions") {
 		t.Fatalf("panic log = %q, want panic value and stack", released.state.Log)
 	}
 }
@@ -389,16 +417,13 @@ func TestUniqueSupervisorReportsCompletedWorkOnRenew(t *testing.T) {
 
 	started := make(chan struct{})
 	finish := make(chan struct{})
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(context.Context) {
 			close(started)
 			<-finish
 		},
 		RepeatAfter: time.Hour,
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
 		supervisor.Stop()
 		supervisor.Wait()
@@ -412,7 +437,7 @@ func TestUniqueSupervisorReportsCompletedWorkOnRenew(t *testing.T) {
 		t.Fatalf("lease actions = %#v, want acquire and renew", actions)
 	}
 	running := actions[1]
-	if running.state.Status != RoutineRunning || running.state.SuccessCount != 0 || running.state.FailureCount != 0 || running.state.Log != "" {
+	if running.state.Status != RoutineRunning || running.state.SuccessCount != 0 || running.state.FailureCount != 0 || running.state.Log != serverLog("") {
 		t.Fatalf("running renew state = %#v, want active task", running.state)
 	}
 
@@ -420,7 +445,7 @@ func TestUniqueSupervisorReportsCompletedWorkOnRenew(t *testing.T) {
 	waitForLeaseAction(t, backend.called, LeaseRenew)
 	actions = backend.recordedActions()
 	renewed := actions[2]
-	if renewed.state.Status != RoutineDone || renewed.state.SuccessCount != 1 || renewed.state.FailureCount != 0 || renewed.state.Log != "" {
+	if renewed.state.Status != RoutineDone || renewed.state.SuccessCount != 1 || renewed.state.FailureCount != 0 || renewed.state.Log != serverLog("") {
 		t.Fatalf("renew state = %#v, want one successful completion", renewed.state)
 	}
 }
@@ -436,14 +461,11 @@ func TestUniqueSupervisorRetriesFailedReleaseAfterPanic(t *testing.T) {
 		},
 	}
 
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(context.Context) {
 			panic("retry release")
 		},
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
 		supervisor.Stop()
 		supervisor.Wait()
@@ -467,15 +489,12 @@ func TestUniqueSupervisorRestartsAfterNormalReturn(t *testing.T) {
 	}
 
 	started := make(chan struct{}, 3)
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(context.Context) {
 			started <- struct{}{}
 		},
 		RepeatAfter: 10 * time.Millisecond,
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
 		supervisor.Stop()
 		supervisor.Wait()
@@ -511,7 +530,7 @@ func TestUniqueSupervisorUsesTaskRepeatDelay(t *testing.T) {
 	finishFirst := make(chan struct{})
 	secondStarted := make(chan struct{})
 	var attempts atomic.Int32
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(ctx context.Context) {
 			if attempts.Add(1) == 1 {
 				close(firstStarted)
@@ -523,9 +542,6 @@ func TestUniqueSupervisorUsesTaskRepeatDelay(t *testing.T) {
 		},
 		RepeatAfter: 50 * time.Millisecond,
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
 		supervisor.Stop()
 		supervisor.Wait()
@@ -559,7 +575,7 @@ func TestUniqueSupervisorRepeatsImmediatelyByDefault(t *testing.T) {
 	finishFirst := make(chan struct{})
 	secondStarted := make(chan struct{})
 	var attempts atomic.Int32
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(ctx context.Context) {
 			if attempts.Add(1) == 1 {
 				close(firstStarted)
@@ -570,9 +586,6 @@ func TestUniqueSupervisorRepeatsImmediatelyByDefault(t *testing.T) {
 			<-ctx.Done()
 		},
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
 		supervisor.Stop()
 		supervisor.Wait()
@@ -628,7 +641,7 @@ func TestUniqueSupervisorReacquiresAfterLeaseLossRacesTaskReturn(t *testing.T) {
 
 	started := make(chan struct{}, 2)
 	var attempts atomic.Int32
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(ctx context.Context) {
 			started <- struct{}{}
 			if attempts.Add(1) == 1 {
@@ -640,9 +653,6 @@ func TestUniqueSupervisorReacquiresAfterLeaseLossRacesTaskReturn(t *testing.T) {
 		},
 		RepeatAfter: 20 * time.Millisecond,
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
 		supervisor.Stop()
 		supervisor.Wait()
@@ -674,15 +684,12 @@ func TestUniqueSupervisorBoundsRenewalCalls(t *testing.T) {
 	}
 
 	stopped := make(chan struct{})
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(ctx context.Context) {
 			<-ctx.Done()
 			close(stopped)
 		},
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
 		supervisor.Stop()
 		supervisor.Wait()
@@ -711,12 +718,9 @@ func TestBackendPanicsDoNotReachSupervisorPanicHandler(t *testing.T) {
 	}
 
 	var handled atomic.Int32
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{Run: func(context.Context) {}}, func(Panic) {
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{Run: func(context.Context) {}}, func(Panic) {
 		handled.Add(1)
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	waitForSignal(t, backend.attempted)
 	waitForSignal(t, backend.attempted)
 	supervisor.Stop()
@@ -726,7 +730,7 @@ func TestBackendPanicsDoNotReachSupervisorPanicHandler(t *testing.T) {
 	}
 
 	releaseTaskStarted := make(chan struct{})
-	releaseSupervisor, err := (&coordinator{
+	releaseSupervisor := (&coordinator{
 		backend: panicReleaseLease{},
 		timing: leaseTiming{
 			ttl:       time.Second,
@@ -741,9 +745,6 @@ func TestBackendPanicsDoNotReachSupervisorPanicHandler(t *testing.T) {
 	}, func(Panic) {
 		handled.Add(1)
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	waitForSignal(t, releaseTaskStarted)
 	releaseSupervisor.Stop()
 	releaseSupervisor.Wait()
@@ -779,16 +780,10 @@ func TestCoordinatorsFailOverWithoutOverlap(t *testing.T) {
 		}
 	}
 
-	firstSupervisor, err := first.startUniqueSupervisor(context.Background(), "reports", task(firstStarted), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	firstSupervisor := first.startUniqueSupervisor(context.Background(), "reports", task(firstStarted), nil)
 	waitForSignal(t, firstStarted)
 
-	secondSupervisor, err := second.startUniqueSupervisor(context.Background(), "reports", task(secondStarted), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	secondSupervisor := second.startUniqueSupervisor(context.Background(), "reports", task(secondStarted), nil)
 
 	select {
 	case <-secondStarted:
@@ -820,7 +815,7 @@ func TestStopRenewsLeaseUntilCleanupFinishes(t *testing.T) {
 	firstStarted := make(chan struct{})
 	cleanupStarted := make(chan struct{})
 	finishCleanup := make(chan struct{})
-	firstSupervisor, err := first.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	firstSupervisor := first.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(ctx context.Context) {
 			close(firstStarted)
 			<-ctx.Done()
@@ -828,22 +823,15 @@ func TestStopRenewsLeaseUntilCleanupFinishes(t *testing.T) {
 			<-finishCleanup
 		},
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	waitForSignal(t, firstStarted)
 
 	secondStarted := make(chan struct{})
-	secondSupervisor, err := second.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	secondSupervisor := second.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(ctx context.Context) {
 			close(secondStarted)
 			<-ctx.Done()
 		},
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	firstSupervisor.Stop()
 	waitForSignal(t, cleanupStarted)
 	select {
@@ -871,16 +859,13 @@ func TestRenewPanicIsContained(t *testing.T) {
 
 	started := make(chan struct{})
 	stopped := make(chan struct{})
-	supervisor, err := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
+	supervisor := configured.startUniqueSupervisor(context.Background(), "reports", uniqueTask{
 		Run: func(ctx context.Context) {
 			close(started)
 			<-ctx.Done()
 			close(stopped)
 		},
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	waitForSignal(t, started)
 	waitForSignal(t, stopped)
 	supervisor.Stop()

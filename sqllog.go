@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 )
 
 const retainedLogsPerRoutineID = 25
@@ -19,14 +18,15 @@ const sqlNameFilterBatchSize = 900
 type sqlQueryContext func(context.Context, string, ...any) (*sql.Rows, error)
 
 type sqlLogStatements struct {
-	create          string
-	createIndex     string
-	insert          string
-	prune           string
-	selectBase      string
-	routineIDColumn string
-	orderBy         string
-	bindVariable    func(int) string
+	create           string
+	createIndex      string
+	insert           string
+	prune            string
+	selectRoutineIDs string
+	selectBase       string
+	routineIDColumn  string
+	orderBy          string
+	bindVariable     func(int) string
 }
 
 // Action atomically applies ownership and current state. Acquire and release
@@ -64,13 +64,16 @@ func (s *sqlLease) GetLogs(ctx context.Context, names ...string) ([]SupervisorLo
 	if s == nil || s.db == nil || s.query == nil {
 		return nil, errors.New("SQL lease is not initialized")
 	}
-	routineIDs, err := uniqueRoutineIDs(names)
-	if err != nil {
-		return nil, err
+	routineIDs := uniqueRoutineIDs(names)
+	if len(names) == 0 {
+		var err error
+		routineIDs, err = s.queryLogRoutineIDs(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
-
 	if len(routineIDs) == 0 {
-		return s.queryLogs(ctx, s.logs.selectBase+s.logs.orderBy, nil)
+		return []SupervisorLog{}, nil
 	}
 
 	logs := make([]SupervisorLog, 0)
@@ -91,13 +94,34 @@ func (s *sqlLease) GetLogs(ctx context.Context, names ...string) ([]SupervisorLo
 	}
 	if len(routineIDs) > sqlNameFilterBatchSize {
 		sort.Slice(logs, func(left, right int) bool {
-			if logs[left].CreatedAt.Equal(logs[right].CreatedAt) {
+			if logs[left].CreatedAt == logs[right].CreatedAt {
 				return logs[left].ID > logs[right].ID
 			}
-			return logs[left].CreatedAt.After(logs[right].CreatedAt)
+			return logs[left].CreatedAt > logs[right].CreatedAt
 		})
 	}
 	return logs, nil
+}
+
+func (s *sqlLease) queryLogRoutineIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.query(ctx, s.logs.selectRoutineIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query supervisor log routine IDs: %w", err)
+	}
+	defer rows.Close()
+
+	routineIDs := make([]string, 0)
+	for rows.Next() {
+		var routineID string
+		if err := rows.Scan(&routineID); err != nil {
+			return nil, fmt.Errorf("scan supervisor log routine ID: %w", err)
+		}
+		routineIDs = append(routineIDs, routineID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate supervisor log routine IDs: %w", err)
+	}
+	return routineIDs, nil
 }
 
 func (s *sqlLease) queryLogs(ctx context.Context, query string, args []any) ([]SupervisorLog, error) {
@@ -110,11 +134,10 @@ func (s *sqlLease) queryLogs(ctx context.Context, query string, args []any) ([]S
 	logs := make([]SupervisorLog, 0)
 	for rows.Next() {
 		var (
-			log       SupervisorLog
-			action    string
-			status    string
-			logText   sql.NullString
-			createdAt any
+			log     SupervisorLog
+			action  string
+			status  string
+			logText sql.NullString
 		)
 		if err := rows.Scan(
 			&log.ID,
@@ -123,17 +146,13 @@ func (s *sqlLease) queryLogs(ctx context.Context, query string, args []any) ([]S
 			&action,
 			&status,
 			&logText,
-			&createdAt,
+			&log.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan supervisor log: %w", err)
 		}
 		log.Action = LeaseAction(action)
 		log.Status = RoutineStatus(status)
 		log.Log = logText.String
-		log.CreatedAt, err = parseSQLLogTime(createdAt)
-		if err != nil {
-			return nil, fmt.Errorf("scan supervisor log timestamp: %w", err)
-		}
 		logs = append(logs, log)
 	}
 	if err := rows.Err(); err != nil {
@@ -154,10 +173,7 @@ func (s *sqlLease) GetStatuses(ctx context.Context, names ...string) ([]Supervis
 	if s == nil || s.db == nil || s.query == nil {
 		return nil, errors.New("SQL lease is not initialized")
 	}
-	routineIDs, err := uniqueRoutineIDs(names)
-	if err != nil {
-		return nil, err
-	}
+	routineIDs := uniqueRoutineIDs(names)
 
 	if len(routineIDs) == 0 {
 		return s.queryStatuses(ctx, s.statements.selectBase+s.statements.orderBy, nil)
@@ -200,8 +216,6 @@ func (s *sqlLease) queryStatuses(ctx context.Context, query string, args []any) 
 			status     SupervisorStatus
 			statusName string
 			logText    sql.NullString
-			expiresAt  any
-			updatedAt  any
 		)
 		if err := rows.Scan(
 			&status.Name,
@@ -210,21 +224,13 @@ func (s *sqlLease) queryStatuses(ctx context.Context, query string, args []any) 
 			&status.SuccessCount,
 			&status.FailureCount,
 			&logText,
-			&expiresAt,
-			&updatedAt,
+			&status.ExpiresAt,
+			&status.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan supervisor status: %w", err)
 		}
 		status.Status = RoutineStatus(statusName)
 		status.Log = logText.String
-		status.ExpiresAt, err = parseSQLLogTime(expiresAt)
-		if err != nil {
-			return nil, fmt.Errorf("scan supervisor status expiry: %w", err)
-		}
-		status.UpdatedAt, err = parseSQLLogTime(updatedAt)
-		if err != nil {
-			return nil, fmt.Errorf("scan supervisor status update time: %w", err)
-		}
 		statuses = append(statuses, status)
 	}
 	if err := rows.Err(); err != nil {
@@ -233,17 +239,14 @@ func (s *sqlLease) queryStatuses(ctx context.Context, query string, args []any) 
 	return statuses, nil
 }
 
-func uniqueRoutineIDs(names []string) ([]string, error) {
+func uniqueRoutineIDs(names []string) []string {
 	if len(names) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	routineIDs := make([]string, 0, len(names))
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		if err := validateRoutineName(name); err != nil {
-			return nil, err
-		}
 		id := routineID(name)
 		if _, exists := seen[id]; exists {
 			continue
@@ -251,7 +254,7 @@ func uniqueRoutineIDs(names []string) ([]string, error) {
 		seen[id] = struct{}{}
 		routineIDs = append(routineIDs, id)
 	}
-	return routineIDs, nil
+	return routineIDs
 }
 
 func filteredSQLQuery(selectBase, routineIDColumn, orderBy string, bindVariable func(int) string, routineIDs []string) (string, []any) {
@@ -298,6 +301,10 @@ func validRoutineStatus(status RoutineStatus) bool {
 }
 
 func (s *sqlLease) recordLog(ctx context.Context, action LeaseAction, state leaseState) {
+	defer func() {
+		_ = recover()
+	}()
+
 	_, err := s.db.ExecContext(
 		ctx,
 		s.logs.insert,
@@ -313,44 +320,6 @@ func (s *sqlLease) recordLog(ctx context.Context, action LeaseAction, state leas
 		return
 	}
 	_, _ = s.db.ExecContext(ctx, s.logs.prune, routineID(state.Name))
-}
-
-func parseSQLLogTime(value any) (time.Time, error) {
-	switch typed := value.(type) {
-	case time.Time:
-		return typed.UTC(), nil
-	case int64:
-		return time.UnixMicro(typed).UTC(), nil
-	case []byte:
-		return parseSQLLogTimeString(string(typed))
-	case string:
-		return parseSQLLogTimeString(typed)
-	default:
-		return time.Time{}, fmt.Errorf("unsupported timestamp type %T", value)
-	}
-}
-
-func parseSQLLogTimeString(value string) (time.Time, error) {
-	withZone := []string{
-		time.RFC3339Nano,
-		"2006-01-02 15:04:05.999999999Z07:00",
-		"2006-01-02 15:04:05.999999999 -07:00",
-	}
-	for _, layout := range withZone {
-		if parsed, err := time.Parse(layout, value); err == nil {
-			return parsed.UTC(), nil
-		}
-	}
-	withoutZone := []string{
-		"2006-01-02 15:04:05.999999999",
-		"2006-01-02 15:04:05",
-	}
-	for _, layout := range withoutZone {
-		if parsed, err := time.ParseInLocation(layout, value, time.UTC); err == nil {
-			return parsed, nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("unsupported timestamp %q", value)
 }
 
 func statementsForSQLLogDialect(dialect SQLDialect) (sqlLogStatements, error) {
@@ -384,11 +353,11 @@ var postgreSQLLogStatements = sqlLogStatements{
     "action" VARCHAR(16) NOT NULL,
     "status" VARCHAR(32) NOT NULL,
     "log" TEXT NOT NULL,
-    "created_at" TIMESTAMPTZ NOT NULL
+	"created_at" BIGINT NOT NULL
 )`,
 	createIndex: `CREATE INDEX IF NOT EXISTS "unique_routine_log_routine_id" ON "unique_routine_log" ("routine_id")`,
 	insert: `INSERT INTO "unique_routine_log" ("id", "routine_id", "name", "owner", "action", "status", "log", "created_at")
-VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)`,
+VALUES ($1, $2, $3, $4, $5, $6, $7, ` + postgreSQLCurrentSeconds + `)`,
 	prune: fmt.Sprintf(`DELETE FROM "unique_routine_log"
 WHERE "id" IN (
     SELECT "id" FROM (
@@ -398,10 +367,11 @@ WHERE "id" IN (
     ) AS "ranked"
 		WHERE "row_number" > %d
 	)`, retainedLogsPerRoutineID),
-	selectBase:      `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
-	routineIDColumn: `"routine_id"`,
-	orderBy:         ` ORDER BY "created_at" DESC, "id" DESC`,
-	bindVariable:    dollarVariable,
+	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "unique_routine_log" ORDER BY "routine_id"`,
+	selectBase:       `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
+	routineIDColumn:  `"routine_id"`,
+	orderBy:          ` ORDER BY "created_at" DESC, "id" DESC`,
+	bindVariable:     dollarVariable,
 }
 
 var mySQLLogStatements = sqlLogStatements{
@@ -413,11 +383,11 @@ var mySQLLogStatements = sqlLogStatements{
     ` + "`action`" + ` VARCHAR(16) NOT NULL,
     ` + "`status`" + ` VARCHAR(32) NOT NULL,
     ` + "`log`" + ` LONGTEXT NOT NULL,
-    ` + "`created_at`" + ` DATETIME(6) NOT NULL,
+	` + "`created_at`" + ` BIGINT NOT NULL,
 	INDEX ` + "`unique_routine_log_routine_id`" + ` (` + "`routine_id`" + `)
 )`,
 	insert: `INSERT INTO ` + "`unique_routine_log`" + ` (` + "`id`" + `, ` + "`routine_id`" + `, ` + "`name`" + `, ` + "`owner`" + `, ` + "`action`" + `, ` + "`status`" + `, ` + "`log`" + `, ` + "`created_at`" + `)
-VALUES (?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(6))`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ` + mySQLCurrentSeconds + `)`,
 	prune: fmt.Sprintf(`DELETE FROM `+"`unique_routine_log`"+`
 WHERE `+"`id`"+` IN (
     SELECT `+"`id`"+` FROM (
@@ -427,10 +397,11 @@ WHERE `+"`id`"+` IN (
     ) AS `+"`ranked`"+`
 		WHERE `+"`row_number`"+` > %d
 	)`, retainedLogsPerRoutineID),
-	selectBase:      `SELECT ` + "`id`" + `, ` + "`name`" + `, ` + "`owner`" + `, ` + "`action`" + `, ` + "`status`" + `, ` + "`log`" + `, ` + "`created_at`" + ` FROM ` + "`unique_routine_log`",
-	routineIDColumn: "`routine_id`",
-	orderBy:         ` ORDER BY ` + "`created_at`" + ` DESC, ` + "`id`" + ` DESC`,
-	bindVariable:    questionVariable,
+	selectRoutineIDs: `SELECT DISTINCT ` + "`routine_id`" + ` FROM ` + "`unique_routine_log`" + ` ORDER BY ` + "`routine_id`",
+	selectBase:       `SELECT ` + "`id`" + `, ` + "`name`" + `, ` + "`owner`" + `, ` + "`action`" + `, ` + "`status`" + `, ` + "`log`" + `, ` + "`created_at`" + ` FROM ` + "`unique_routine_log`",
+	routineIDColumn:  "`routine_id`",
+	orderBy:          ` ORDER BY ` + "`created_at`" + ` DESC, ` + "`id`" + ` DESC`,
+	bindVariable:     questionVariable,
 }
 
 var sqliteLogStatements = sqlLogStatements{
@@ -446,7 +417,7 @@ var sqliteLogStatements = sqlLogStatements{
 ) WITHOUT ROWID`,
 	createIndex: `CREATE INDEX IF NOT EXISTS "unique_routine_log_routine_id" ON "unique_routine_log" ("routine_id")`,
 	insert: `INSERT INTO "unique_routine_log" ("id", "routine_id", "name", "owner", "action", "status", "log", "created_at")
-VALUES (?, ?, ?, ?, ?, ?, ?, ` + sqliteCurrentMicroseconds + `)`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ` + sqliteCurrentSeconds + `)`,
 	prune: fmt.Sprintf(`DELETE FROM "unique_routine_log"
 WHERE "id" IN (
     SELECT "id" FROM (
@@ -456,10 +427,11 @@ WHERE "id" IN (
     ) AS "ranked"
 		WHERE "row_number" > %d
 	)`, retainedLogsPerRoutineID),
-	selectBase:      `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
-	routineIDColumn: `"routine_id"`,
-	orderBy:         ` ORDER BY "created_at" DESC, "id" DESC`,
-	bindVariable:    questionVariable,
+	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "unique_routine_log" ORDER BY "routine_id"`,
+	selectBase:       `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
+	routineIDColumn:  `"routine_id"`,
+	orderBy:          ` ORDER BY "created_at" DESC, "id" DESC`,
+	bindVariable:     questionVariable,
 }
 
 var sqlServerLogStatements = sqlLogStatements{
@@ -474,7 +446,7 @@ var sqlServerLogStatements = sqlLogStatements{
             [action] NVARCHAR(16) NOT NULL,
             [status] NVARCHAR(32) NOT NULL,
             [log] NVARCHAR(MAX) NOT NULL,
-            [created_at] DATETIME2 NOT NULL
+			[created_at] BIGINT NOT NULL
         )
     END
 END TRY
@@ -497,7 +469,7 @@ BEGIN CATCH
 		THROW;
 END CATCH`,
 	insert: `INSERT INTO [unique_routine_log] ([id], [routine_id], [name], [owner], [action], [status], [log], [created_at])
-VALUES (@p1, @p2, @p3, @p4, @p5, @p6, @p7, SYSUTCDATETIME())`,
+VALUES (@p1, @p2, @p3, @p4, @p5, @p6, @p7, ` + sqlServerCurrentSeconds + `)`,
 	prune: fmt.Sprintf(`DELETE FROM [unique_routine_log]
 WHERE [id] IN (
     SELECT [id] FROM (
@@ -507,17 +479,18 @@ WHERE [id] IN (
     ) AS [ranked]
 		WHERE [row_number] > %d
 	)`, retainedLogsPerRoutineID),
-	selectBase:      `SELECT [id], [name], [owner], [action], [status], [log], [created_at] FROM [unique_routine_log]`,
-	routineIDColumn: `[routine_id]`,
-	orderBy:         ` ORDER BY [created_at] DESC, [id] DESC`,
-	bindVariable:    sqlServerVariable,
+	selectRoutineIDs: `SELECT DISTINCT [routine_id] FROM [unique_routine_log] ORDER BY [routine_id]`,
+	selectBase:       `SELECT [id], [name], [owner], [action], [status], [log], [created_at] FROM [unique_routine_log]`,
+	routineIDColumn:  `[routine_id]`,
+	orderBy:          ` ORDER BY [created_at] DESC, [id] DESC`,
+	bindVariable:     sqlServerVariable,
 }
 
 var oracleLogStatements = sqlLogStatements{
 	create: `DECLARE
 	table_count PLS_INTEGER;
 BEGIN
-	EXECUTE IMMEDIATE 'CREATE TABLE "unique_routine_log" ("id" VARCHAR2(64) NOT NULL, "routine_id" VARCHAR2(64) NOT NULL, "name" VARCHAR2(255) NOT NULL, "owner" VARCHAR2(128) NOT NULL, "action" VARCHAR2(16) NOT NULL, "status" VARCHAR2(32) NOT NULL, "log" CLOB, "created_at" TIMESTAMP WITH TIME ZONE NOT NULL, CONSTRAINT "unique_routine_log_pk" PRIMARY KEY ("id"))';
+	EXECUTE IMMEDIATE 'CREATE TABLE "unique_routine_log" ("id" VARCHAR2(64) NOT NULL, "routine_id" VARCHAR2(64) NOT NULL, "name" VARCHAR2(255) NOT NULL, "owner" VARCHAR2(128) NOT NULL, "action" VARCHAR2(16) NOT NULL, "status" VARCHAR2(32) NOT NULL, "log" CLOB, "created_at" NUMBER(19) NOT NULL, CONSTRAINT "unique_routine_log_pk" PRIMARY KEY ("id"))';
 EXCEPTION
     WHEN OTHERS THEN
         IF SQLCODE != -955 THEN
@@ -545,7 +518,7 @@ BEGIN
 	END;
 END;`,
 	insert: `INSERT INTO "unique_routine_log" ("id", "routine_id", "name", "owner", "action", "status", "log", "created_at")
-VALUES (:1, :2, :3, :4, :5, :6, :7, SYSTIMESTAMP)`,
+VALUES (:1, :2, :3, :4, :5, :6, :7, ` + oracleCurrentSeconds + `)`,
 	prune: fmt.Sprintf(`DELETE FROM "unique_routine_log"
 WHERE "id" IN (
     SELECT "id" FROM (
@@ -555,8 +528,9 @@ WHERE "id" IN (
     )
 		WHERE "row_number" > %d
 	)`, retainedLogsPerRoutineID),
-	selectBase:      `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
-	routineIDColumn: `"routine_id"`,
-	orderBy:         ` ORDER BY "created_at" DESC, "id" DESC`,
-	bindVariable:    oracleVariable,
+	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "unique_routine_log" ORDER BY "routine_id"`,
+	selectBase:       `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
+	routineIDColumn:  `"routine_id"`,
+	orderBy:          ` ORDER BY "created_at" DESC, "id" DESC`,
+	bindVariable:     oracleVariable,
 }

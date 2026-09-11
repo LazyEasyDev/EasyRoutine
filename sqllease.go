@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math"
 	"time"
 )
 
@@ -179,18 +178,7 @@ func routineID(name string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func microseconds(ttl time.Duration) (int64, bool) {
-	if ttl <= 0 {
-		return 0, false
-	}
-	microseconds := int64(ttl / time.Microsecond)
-	if ttl%time.Microsecond != 0 {
-		microseconds++
-	}
-	return microseconds, true
-}
-
-func sqlServerSeconds(ttl time.Duration) (int64, bool) {
+func ttlSeconds(ttl time.Duration) (int64, bool) {
 	if ttl <= 0 {
 		return 0, false
 	}
@@ -198,7 +186,7 @@ func sqlServerSeconds(ttl time.Duration) (int64, bool) {
 	if ttl%time.Second != 0 {
 		seconds++
 	}
-	return seconds, seconds <= math.MaxInt32
+	return seconds, true
 }
 
 func statementsForSQLDialect(dialect SQLDialect) (sqlLeaseStatements, error) {
@@ -220,101 +208,105 @@ func statementsForSQLDialect(dialect SQLDialect) (sqlLeaseStatements, error) {
 	}
 }
 
+const postgreSQLCurrentSeconds = "CAST(FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)) AS BIGINT)"
+
 var postgreSQLLeaseStatements = sqlLeaseStatements{
 	create: `CREATE TABLE IF NOT EXISTS "unique_routine" (
 	"routine_id" VARCHAR(64) PRIMARY KEY,
 	"name" TEXT NOT NULL,
     "owner" TEXT NOT NULL,
-	"expires_at" TIMESTAMPTZ NOT NULL,
+	"expires_at" BIGINT NOT NULL,
 	"status" VARCHAR(32) NOT NULL,
 	"success_count" BIGINT NOT NULL,
 	"failure_count" BIGINT NOT NULL,
 	"log" TEXT NOT NULL,
-	"updated_at" TIMESTAMPTZ NOT NULL
+	"updated_at" BIGINT NOT NULL
 )`,
 	acquireExisting: `UPDATE "unique_routine"
 SET "name" = $1,
 	"owner" = $2,
-	"expires_at" = CURRENT_TIMESTAMP + ($3 * INTERVAL '1 microsecond'),
+	"expires_at" = ` + postgreSQLCurrentSeconds + ` + $3,
 	"status" = $4,
 	"success_count" = $5,
 	"failure_count" = $6,
 	"log" = $7,
-	"updated_at" = CURRENT_TIMESTAMP
-WHERE "routine_id" = $8 AND "expires_at" <= CURRENT_TIMESTAMP`,
+	"updated_at" = ` + postgreSQLCurrentSeconds + `
+WHERE "routine_id" = $8 AND "expires_at" <= ` + postgreSQLCurrentSeconds,
 	acquireNew: `INSERT INTO "unique_routine" ("routine_id", "name", "owner", "expires_at", "status", "success_count", "failure_count", "log", "updated_at")
-VALUES ($1, $2, $3, CURRENT_TIMESTAMP + ($4 * INTERVAL '1 microsecond'), $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
+VALUES ($1, $2, $3, ` + postgreSQLCurrentSeconds + ` + $4, $5, $6, $7, $8, ` + postgreSQLCurrentSeconds + `)`,
 	renew: `UPDATE "unique_routine"
-	SET "expires_at" = CURRENT_TIMESTAMP + ($1 * INTERVAL '1 microsecond'),
+	SET "expires_at" = ` + postgreSQLCurrentSeconds + ` + $1,
 	"status" = $2,
 	"success_count" = $3,
 	"failure_count" = $4,
 	"log" = $5,
-	"updated_at" = CURRENT_TIMESTAMP
-WHERE "routine_id" = $6 AND "owner" = $7 AND "expires_at" > CURRENT_TIMESTAMP`,
+	"updated_at" = ` + postgreSQLCurrentSeconds + `
+WHERE "routine_id" = $6 AND "owner" = $7 AND "expires_at" > ` + postgreSQLCurrentSeconds,
 	release: `UPDATE "unique_routine"
-SET "expires_at" = CURRENT_TIMESTAMP,
+SET "expires_at" = ` + postgreSQLCurrentSeconds + `,
 	"status" = $1,
 	"success_count" = $2,
 	"failure_count" = $3,
 	"log" = $4,
-	"updated_at" = CURRENT_TIMESTAMP
+	"updated_at" = ` + postgreSQLCurrentSeconds + `
 WHERE "routine_id" = $5 AND "owner" = $6`,
-	ttlArgument:     microseconds,
+	ttlArgument:     ttlSeconds,
 	selectBase:      `SELECT "name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at" FROM "unique_routine"`,
 	routineIDColumn: `"routine_id"`,
 	orderBy:         ` ORDER BY "name"`,
 	bindVariable:    dollarVariable,
 }
 
+const mySQLCurrentSeconds = "UNIX_TIMESTAMP()"
+
 var mySQLLeaseStatements = sqlLeaseStatements{
 	create: `CREATE TABLE IF NOT EXISTS ` + "`unique_routine`" + ` (
 	` + "`routine_id`" + ` VARCHAR(64) NOT NULL PRIMARY KEY,
 	` + "`name`" + ` VARCHAR(255) NOT NULL,
     ` + "`owner`" + ` VARCHAR(128) NOT NULL,
-	` + "`expires_at`" + ` DATETIME(6) NOT NULL,
+	` + "`expires_at`" + ` BIGINT NOT NULL,
 	` + "`status`" + ` VARCHAR(32) NOT NULL,
 	` + "`success_count`" + ` BIGINT NOT NULL,
 	` + "`failure_count`" + ` BIGINT NOT NULL,
 	` + "`log`" + ` LONGTEXT NOT NULL,
-	` + "`updated_at`" + ` DATETIME(6) NOT NULL
+	` + "`updated_at`" + ` BIGINT NOT NULL
 )`,
 	acquireExisting: `UPDATE ` + "`unique_routine`" + `
 SET ` + "`name`" + ` = ?,
 	` + "`owner`" + ` = ?,
-	` + "`expires_at`" + ` = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(6)),
+	` + "`expires_at`" + ` = ` + mySQLCurrentSeconds + ` + ?,
 	` + "`status`" + ` = ?,
 	` + "`success_count`" + ` = ?,
 	` + "`failure_count`" + ` = ?,
 	` + "`log`" + ` = ?,
-	` + "`updated_at`" + ` = UTC_TIMESTAMP(6)
-WHERE ` + "`routine_id`" + ` = ? AND ` + "`expires_at`" + ` <= UTC_TIMESTAMP(6)`,
+	` + "`updated_at`" + ` = ` + mySQLCurrentSeconds + `
+WHERE ` + "`routine_id`" + ` = ? AND ` + "`expires_at`" + ` <= ` + mySQLCurrentSeconds,
 	acquireNew: `INSERT INTO ` + "`unique_routine`" + ` (` + "`routine_id`" + `, ` + "`name`" + `, ` + "`owner`" + `, ` + "`expires_at`" + `, ` + "`status`" + `, ` + "`success_count`" + `, ` + "`failure_count`" + `, ` + "`log`" + `, ` + "`updated_at`" + `)
-VALUES (?, ?, ?, TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(6)), ?, ?, ?, ?, UTC_TIMESTAMP(6))`,
+VALUES (?, ?, ?, ` + mySQLCurrentSeconds + ` + ?, ?, ?, ?, ?, ` + mySQLCurrentSeconds + `)`,
 	renew: `UPDATE ` + "`unique_routine`" + `
-	SET ` + "`expires_at`" + ` = TIMESTAMPADD(MICROSECOND, ?, UTC_TIMESTAMP(6)),
+	SET ` + "`expires_at`" + ` = ` + mySQLCurrentSeconds + ` + ?,
 	` + "`status`" + ` = ?,
 	` + "`success_count`" + ` = ?,
 	` + "`failure_count`" + ` = ?,
 	` + "`log`" + ` = ?,
-	` + "`updated_at`" + ` = UTC_TIMESTAMP(6)
-WHERE ` + "`routine_id`" + ` = ? AND ` + "`owner`" + ` = ? AND ` + "`expires_at`" + ` > UTC_TIMESTAMP(6)`,
+	` + "`updated_at`" + ` = ` + mySQLCurrentSeconds + `
+WHERE ` + "`routine_id`" + ` = ? AND ` + "`owner`" + ` = ? AND ` + "`expires_at`" + ` > ` + mySQLCurrentSeconds,
 	release: `UPDATE ` + "`unique_routine`" + `
-SET ` + "`expires_at`" + ` = UTC_TIMESTAMP(6),
+SET ` + "`expires_at`" + ` = ` + mySQLCurrentSeconds + `,
 	` + "`status`" + ` = ?,
 	` + "`success_count`" + ` = ?,
 	` + "`failure_count`" + ` = ?,
 	` + "`log`" + ` = ?,
-	` + "`updated_at`" + ` = UTC_TIMESTAMP(6)
+	` + "`updated_at`" + ` = ` + mySQLCurrentSeconds + `
 WHERE ` + "`routine_id`" + ` = ? AND ` + "`owner`" + ` = ?`,
-	ttlArgument:     microseconds,
+	ttlArgument:     ttlSeconds,
 	selectBase:      `SELECT ` + "`name`" + `, ` + "`owner`" + `, ` + "`status`" + `, ` + "`success_count`" + `, ` + "`failure_count`" + `, ` + "`log`" + `, ` + "`expires_at`" + `, ` + "`updated_at`" + ` FROM ` + "`unique_routine`",
 	routineIDColumn: "`routine_id`",
 	orderBy:         ` ORDER BY ` + "`name`",
 	bindVariable:    questionVariable,
 }
 
-const sqliteCurrentMicroseconds = "CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER)"
+const sqliteCurrentSeconds = "CAST(strftime('%s', 'now') AS INTEGER)"
 
 var sqliteLeaseStatements = sqlLeaseStatements{
 	create: `CREATE TABLE IF NOT EXISTS "unique_routine" (
@@ -331,37 +323,39 @@ var sqliteLeaseStatements = sqlLeaseStatements{
 	acquireExisting: `UPDATE "unique_routine"
 SET "name" = ?,
 	"owner" = ?,
-	"expires_at" = ` + sqliteCurrentMicroseconds + ` + ?,
+	"expires_at" = ` + sqliteCurrentSeconds + ` + ?,
 	"status" = ?,
 	"success_count" = ?,
 	"failure_count" = ?,
 	"log" = ?,
-	"updated_at" = ` + sqliteCurrentMicroseconds + `
-WHERE "routine_id" = ? AND "expires_at" <= ` + sqliteCurrentMicroseconds,
+	"updated_at" = ` + sqliteCurrentSeconds + `
+WHERE "routine_id" = ? AND "expires_at" <= ` + sqliteCurrentSeconds,
 	acquireNew: `INSERT INTO "unique_routine" ("routine_id", "name", "owner", "expires_at", "status", "success_count", "failure_count", "log", "updated_at")
-VALUES (?, ?, ?, ` + sqliteCurrentMicroseconds + ` + ?, ?, ?, ?, ?, ` + sqliteCurrentMicroseconds + `)`,
+VALUES (?, ?, ?, ` + sqliteCurrentSeconds + ` + ?, ?, ?, ?, ?, ` + sqliteCurrentSeconds + `)`,
 	renew: `UPDATE "unique_routine"
-	SET "expires_at" = ` + sqliteCurrentMicroseconds + ` + ?,
+	SET "expires_at" = ` + sqliteCurrentSeconds + ` + ?,
 	"status" = ?,
 	"success_count" = ?,
 	"failure_count" = ?,
 	"log" = ?,
-	"updated_at" = ` + sqliteCurrentMicroseconds + `
-WHERE "routine_id" = ? AND "owner" = ? AND "expires_at" > ` + sqliteCurrentMicroseconds,
+	"updated_at" = ` + sqliteCurrentSeconds + `
+WHERE "routine_id" = ? AND "owner" = ? AND "expires_at" > ` + sqliteCurrentSeconds,
 	release: `UPDATE "unique_routine"
-SET "expires_at" = ` + sqliteCurrentMicroseconds + `,
+SET "expires_at" = ` + sqliteCurrentSeconds + `,
 	"status" = ?,
 	"success_count" = ?,
 	"failure_count" = ?,
 	"log" = ?,
-	"updated_at" = ` + sqliteCurrentMicroseconds + `
+	"updated_at" = ` + sqliteCurrentSeconds + `
 WHERE "routine_id" = ? AND "owner" = ?`,
-	ttlArgument:     microseconds,
+	ttlArgument:     ttlSeconds,
 	selectBase:      `SELECT "name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at" FROM "unique_routine"`,
 	routineIDColumn: `"routine_id"`,
 	orderBy:         ` ORDER BY "name"`,
 	bindVariable:    questionVariable,
 }
+
+const sqlServerCurrentSeconds = "DATEDIFF_BIG(SECOND, CAST('1970-01-01T00:00:00' AS DATETIME2), SYSUTCDATETIME())"
 
 var sqlServerLeaseStatements = sqlLeaseStatements{
 	create: `BEGIN TRY
@@ -371,12 +365,12 @@ var sqlServerLeaseStatements = sqlLeaseStatements{
 			[routine_id] VARCHAR(64) NOT NULL PRIMARY KEY,
 			[name] NVARCHAR(255) NOT NULL,
             [owner] NVARCHAR(128) NOT NULL,
-			[expires_at] DATETIME2 NOT NULL,
+			[expires_at] BIGINT NOT NULL,
 			[status] NVARCHAR(32) NOT NULL,
 			[success_count] BIGINT NOT NULL,
 			[failure_count] BIGINT NOT NULL,
 			[log] NVARCHAR(MAX) NOT NULL,
-			[updated_at] DATETIME2 NOT NULL
+			[updated_at] BIGINT NOT NULL
         )
     END
 END TRY
@@ -387,43 +381,45 @@ END CATCH`,
 	acquireExisting: `UPDATE [unique_routine]
 SET [name] = @p1,
 	[owner] = @p2,
-	[expires_at] = DATEADD(SECOND, @p3, SYSUTCDATETIME()),
+	[expires_at] = ` + sqlServerCurrentSeconds + ` + @p3,
 	[status] = @p4,
 	[success_count] = @p5,
 	[failure_count] = @p6,
 	[log] = @p7,
-	[updated_at] = SYSUTCDATETIME()
-WHERE [routine_id] = @p8 AND [expires_at] <= SYSUTCDATETIME()`,
+	[updated_at] = ` + sqlServerCurrentSeconds + `
+WHERE [routine_id] = @p8 AND [expires_at] <= ` + sqlServerCurrentSeconds,
 	acquireNew: `INSERT INTO [unique_routine] ([routine_id], [name], [owner], [expires_at], [status], [success_count], [failure_count], [log], [updated_at])
-VALUES (@p1, @p2, @p3, DATEADD(SECOND, @p4, SYSUTCDATETIME()), @p5, @p6, @p7, @p8, SYSUTCDATETIME())`,
+VALUES (@p1, @p2, @p3, ` + sqlServerCurrentSeconds + ` + @p4, @p5, @p6, @p7, @p8, ` + sqlServerCurrentSeconds + `)`,
 	renew: `UPDATE [unique_routine]
-	SET [expires_at] = DATEADD(SECOND, @p1, SYSUTCDATETIME()),
+	SET [expires_at] = ` + sqlServerCurrentSeconds + ` + @p1,
 	[status] = @p2,
 	[success_count] = @p3,
 	[failure_count] = @p4,
 	[log] = @p5,
-	[updated_at] = SYSUTCDATETIME()
-WHERE [routine_id] = @p6 AND [owner] = @p7 AND [expires_at] > SYSUTCDATETIME()`,
+	[updated_at] = ` + sqlServerCurrentSeconds + `
+WHERE [routine_id] = @p6 AND [owner] = @p7 AND [expires_at] > ` + sqlServerCurrentSeconds,
 	release: `UPDATE [unique_routine]
-SET [expires_at] = SYSUTCDATETIME(),
+SET [expires_at] = ` + sqlServerCurrentSeconds + `,
 	[status] = @p1,
 	[success_count] = @p2,
 	[failure_count] = @p3,
 	[log] = @p4,
-	[updated_at] = SYSUTCDATETIME()
+	[updated_at] = ` + sqlServerCurrentSeconds + `
 WHERE [routine_id] = @p5 AND [owner] = @p6`,
-	ttlArgument:     sqlServerSeconds,
+	ttlArgument:     ttlSeconds,
 	selectBase:      `SELECT [name], [owner], [status], [success_count], [failure_count], [log], [expires_at], [updated_at] FROM [unique_routine]`,
 	routineIDColumn: `[routine_id]`,
 	orderBy:         ` ORDER BY [name]`,
 	bindVariable:    sqlServerVariable,
 }
 
+const oracleCurrentSeconds = "FLOOR((CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE) - DATE '1970-01-01') * 86400)"
+
 var oracleLeaseStatements = sqlLeaseStatements{
 	create: `DECLARE
 	table_count PLS_INTEGER;
 BEGIN
-	EXECUTE IMMEDIATE 'CREATE TABLE "unique_routine" ("routine_id" VARCHAR2(64) NOT NULL, "name" VARCHAR2(255) NOT NULL, "owner" VARCHAR2(128) NOT NULL, "expires_at" TIMESTAMP WITH TIME ZONE NOT NULL, "status" VARCHAR2(32) NOT NULL, "success_count" NUMBER(19) NOT NULL, "failure_count" NUMBER(19) NOT NULL, "log" CLOB, "updated_at" TIMESTAMP WITH TIME ZONE NOT NULL, CONSTRAINT "unique_routine_pk" PRIMARY KEY ("routine_id"))';
+	EXECUTE IMMEDIATE 'CREATE TABLE "unique_routine" ("routine_id" VARCHAR2(64) NOT NULL, "name" VARCHAR2(255) NOT NULL, "owner" VARCHAR2(128) NOT NULL, "expires_at" NUMBER(19) NOT NULL, "status" VARCHAR2(32) NOT NULL, "success_count" NUMBER(19) NOT NULL, "failure_count" NUMBER(19) NOT NULL, "log" CLOB, "updated_at" NUMBER(19) NOT NULL, CONSTRAINT "unique_routine_pk" PRIMARY KEY ("routine_id"))';
 EXCEPTION
     WHEN OTHERS THEN
         IF SQLCODE != -955 THEN
@@ -437,32 +433,32 @@ END;`,
 	acquireExisting: `UPDATE "unique_routine"
 SET "name" = :1,
 	"owner" = :2,
-	"expires_at" = SYSTIMESTAMP + NUMTODSINTERVAL(:3 / 1000000, 'SECOND'),
+	"expires_at" = ` + oracleCurrentSeconds + ` + :3,
 	"status" = :4,
 	"success_count" = :5,
 	"failure_count" = :6,
 	"log" = :7,
-	"updated_at" = SYSTIMESTAMP
-WHERE "routine_id" = :8 AND "expires_at" <= SYSTIMESTAMP`,
+	"updated_at" = ` + oracleCurrentSeconds + `
+WHERE "routine_id" = :8 AND "expires_at" <= ` + oracleCurrentSeconds,
 	acquireNew: `INSERT INTO "unique_routine" ("routine_id", "name", "owner", "expires_at", "status", "success_count", "failure_count", "log", "updated_at")
-VALUES (:1, :2, :3, SYSTIMESTAMP + NUMTODSINTERVAL(:4 / 1000000, 'SECOND'), :5, :6, :7, :8, SYSTIMESTAMP)`,
+VALUES (:1, :2, :3, ` + oracleCurrentSeconds + ` + :4, :5, :6, :7, :8, ` + oracleCurrentSeconds + `)`,
 	renew: `UPDATE "unique_routine"
-	SET "expires_at" = SYSTIMESTAMP + NUMTODSINTERVAL(:1 / 1000000, 'SECOND'),
+	SET "expires_at" = ` + oracleCurrentSeconds + ` + :1,
 	"status" = :2,
 	"success_count" = :3,
 	"failure_count" = :4,
 	"log" = :5,
-	"updated_at" = SYSTIMESTAMP
-WHERE "routine_id" = :6 AND "owner" = :7 AND "expires_at" > SYSTIMESTAMP`,
+	"updated_at" = ` + oracleCurrentSeconds + `
+WHERE "routine_id" = :6 AND "owner" = :7 AND "expires_at" > ` + oracleCurrentSeconds,
 	release: `UPDATE "unique_routine"
-SET "expires_at" = SYSTIMESTAMP,
+SET "expires_at" = ` + oracleCurrentSeconds + `,
 	"status" = :1,
 	"success_count" = :2,
 	"failure_count" = :3,
 	"log" = :4,
-	"updated_at" = SYSTIMESTAMP
+	"updated_at" = ` + oracleCurrentSeconds + `
 WHERE "routine_id" = :5 AND "owner" = :6`,
-	ttlArgument:     microseconds,
+	ttlArgument:     ttlSeconds,
 	selectBase:      `SELECT "name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at" FROM "unique_routine"`,
 	routineIDColumn: `"routine_id"`,
 	orderBy:         ` ORDER BY "name"`,

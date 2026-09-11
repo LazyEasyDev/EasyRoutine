@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -17,9 +16,10 @@ import (
 var _ leaseProvider = (*sqlLease)(nil)
 
 type sqlExecStep struct {
-	rows    int64
-	execErr error
-	rowsErr error
+	rows       int64
+	execErr    error
+	rowsErr    error
+	panicValue any
 }
 
 type sqlExecCall struct {
@@ -58,6 +58,9 @@ func (s *scriptedSQLExecer) ExecContext(_ context.Context, query string, args ..
 	}
 
 	step := s.steps[len(s.calls)-1]
+	if step.panicValue != nil {
+		panic(step.panicValue)
+	}
 	if step.execErr != nil {
 		return nil, step.execErr
 	}
@@ -168,21 +171,22 @@ func (r *scriptedSQLRows) Next(values []driver.Value) error {
 
 func TestSQLLeaseSupportsKnownDialects(t *testing.T) {
 	tests := []struct {
-		dialect      SQLDialect
-		marker       string
-		leaseClock   string
-		logClock     string
-		primaryKey   string
-		releaseGuard string
+		dialect         SQLDialect
+		leaseClock      string
+		logClock        string
+		primaryKey      string
+		leaseTimeColumn string
+		logTimeColumn   string
+		releaseGuard    string
 	}{
-		{dialect: SQLPostgreSQL, marker: "INTERVAL '1 microsecond'", leaseClock: "CURRENT_TIMESTAMP", logClock: "CURRENT_TIMESTAMP", primaryKey: `"routine_id" VARCHAR(64) PRIMARY KEY`, releaseGuard: `WHERE "routine_id" = $5 AND "owner" = $6`},
-		{dialect: SQLMySQL, marker: "TIMESTAMPADD(MICROSECOND", leaseClock: "UTC_TIMESTAMP(6)", logClock: "UTC_TIMESTAMP(6)", primaryKey: "`routine_id` VARCHAR(64) NOT NULL PRIMARY KEY", releaseGuard: "WHERE `routine_id` = ? AND `owner` = ?"},
-		{dialect: SQLMariaDB, marker: "TIMESTAMPADD(MICROSECOND", leaseClock: "UTC_TIMESTAMP(6)", logClock: "UTC_TIMESTAMP(6)", primaryKey: "`routine_id` VARCHAR(64) NOT NULL PRIMARY KEY", releaseGuard: "WHERE `routine_id` = ? AND `owner` = ?"},
-		{dialect: SQLTiDB, marker: "TIMESTAMPADD(MICROSECOND", leaseClock: "UTC_TIMESTAMP(6)", logClock: "UTC_TIMESTAMP(6)", primaryKey: "`routine_id` VARCHAR(64) NOT NULL PRIMARY KEY", releaseGuard: "WHERE `routine_id` = ? AND `owner` = ?"},
-		{dialect: SQLSQLite, marker: "julianday('now')", leaseClock: "julianday('now')", logClock: "julianday('now')", primaryKey: `"routine_id" TEXT PRIMARY KEY`, releaseGuard: `WHERE "routine_id" = ? AND "owner" = ?`},
-		{dialect: SQLServer, marker: "DATEADD(SECOND", leaseClock: "SYSUTCDATETIME()", logClock: "SYSUTCDATETIME()", primaryKey: "[routine_id] VARCHAR(64) NOT NULL PRIMARY KEY", releaseGuard: "WHERE [routine_id] = @p5 AND [owner] = @p6"},
-		{dialect: SQLGaussDB, marker: "INTERVAL '1 microsecond'", leaseClock: "CURRENT_TIMESTAMP", logClock: "CURRENT_TIMESTAMP", primaryKey: `"routine_id" VARCHAR(64) PRIMARY KEY`, releaseGuard: `WHERE "routine_id" = $5 AND "owner" = $6`},
-		{dialect: SQLOracle, marker: "NUMTODSINTERVAL", leaseClock: "SYSTIMESTAMP", logClock: "SYSTIMESTAMP", primaryKey: `PRIMARY KEY ("routine_id")`, releaseGuard: `WHERE "routine_id" = :5 AND "owner" = :6`},
+		{dialect: SQLPostgreSQL, leaseClock: postgreSQLCurrentSeconds, logClock: postgreSQLCurrentSeconds, primaryKey: `"routine_id" VARCHAR(64) PRIMARY KEY`, leaseTimeColumn: `"expires_at" BIGINT NOT NULL`, logTimeColumn: `"created_at" BIGINT NOT NULL`, releaseGuard: `WHERE "routine_id" = $5 AND "owner" = $6`},
+		{dialect: SQLMySQL, leaseClock: mySQLCurrentSeconds, logClock: mySQLCurrentSeconds, primaryKey: "`routine_id` VARCHAR(64) NOT NULL PRIMARY KEY", leaseTimeColumn: "`expires_at` BIGINT NOT NULL", logTimeColumn: "`created_at` BIGINT NOT NULL", releaseGuard: "WHERE `routine_id` = ? AND `owner` = ?"},
+		{dialect: SQLMariaDB, leaseClock: mySQLCurrentSeconds, logClock: mySQLCurrentSeconds, primaryKey: "`routine_id` VARCHAR(64) NOT NULL PRIMARY KEY", leaseTimeColumn: "`expires_at` BIGINT NOT NULL", logTimeColumn: "`created_at` BIGINT NOT NULL", releaseGuard: "WHERE `routine_id` = ? AND `owner` = ?"},
+		{dialect: SQLTiDB, leaseClock: mySQLCurrentSeconds, logClock: mySQLCurrentSeconds, primaryKey: "`routine_id` VARCHAR(64) NOT NULL PRIMARY KEY", leaseTimeColumn: "`expires_at` BIGINT NOT NULL", logTimeColumn: "`created_at` BIGINT NOT NULL", releaseGuard: "WHERE `routine_id` = ? AND `owner` = ?"},
+		{dialect: SQLSQLite, leaseClock: sqliteCurrentSeconds, logClock: sqliteCurrentSeconds, primaryKey: `"routine_id" TEXT PRIMARY KEY`, leaseTimeColumn: `"expires_at" INTEGER NOT NULL`, logTimeColumn: `"created_at" INTEGER NOT NULL`, releaseGuard: `WHERE "routine_id" = ? AND "owner" = ?`},
+		{dialect: SQLServer, leaseClock: sqlServerCurrentSeconds, logClock: sqlServerCurrentSeconds, primaryKey: "[routine_id] VARCHAR(64) NOT NULL PRIMARY KEY", leaseTimeColumn: "[expires_at] BIGINT NOT NULL", logTimeColumn: "[created_at] BIGINT NOT NULL", releaseGuard: "WHERE [routine_id] = @p5 AND [owner] = @p6"},
+		{dialect: SQLGaussDB, leaseClock: postgreSQLCurrentSeconds, logClock: postgreSQLCurrentSeconds, primaryKey: `"routine_id" VARCHAR(64) PRIMARY KEY`, leaseTimeColumn: `"expires_at" BIGINT NOT NULL`, logTimeColumn: `"created_at" BIGINT NOT NULL`, releaseGuard: `WHERE "routine_id" = $5 AND "owner" = $6`},
+		{dialect: SQLOracle, leaseClock: oracleCurrentSeconds, logClock: oracleCurrentSeconds, primaryKey: `PRIMARY KEY ("routine_id")`, leaseTimeColumn: `"expires_at" NUMBER(19) NOT NULL`, logTimeColumn: `"created_at" NUMBER(19) NOT NULL`, releaseGuard: `WHERE "routine_id" = :5 AND "owner" = :6`},
 	}
 
 	for _, test := range tests {
@@ -208,6 +212,15 @@ func TestSQLLeaseSupportsKnownDialects(t *testing.T) {
 			if !strings.Contains(backend.statements.create, test.primaryKey) {
 				t.Fatalf("lease schema %q does not define routine ID primary key %q", backend.statements.create, test.primaryKey)
 			}
+			if !strings.Contains(backend.statements.create, test.leaseTimeColumn) || !strings.Contains(backend.statements.create, strings.Replace(test.leaseTimeColumn, "expires_at", "updated_at", 1)) {
+				t.Fatalf("lease schema %q does not define integer Unix-second columns", backend.statements.create)
+			}
+			if !strings.Contains(backend.logs.create, test.logTimeColumn) {
+				t.Fatalf("log schema %q does not define an integer Unix-second column", backend.logs.create)
+			}
+			if !strings.Contains(backend.logs.selectRoutineIDs, backend.logs.routineIDColumn) {
+				t.Fatalf("log routine ID query %q does not select %q", backend.logs.selectRoutineIDs, backend.logs.routineIDColumn)
+			}
 			if !strings.HasPrefix(backend.statements.release, "UPDATE") {
 				t.Fatalf("release statement %q does not retain current state", backend.statements.release)
 			}
@@ -226,9 +239,6 @@ func TestSQLLeaseSupportsKnownDialects(t *testing.T) {
 				if strings.Contains(statement, "success_count") || strings.Contains(statement, "failure_count") {
 					t.Fatalf("history statement %q contains current-state counters", statement)
 				}
-			}
-			if !strings.Contains(backend.statements.renew, test.marker) {
-				t.Fatalf("renew statement %q does not contain %q", backend.statements.renew, test.marker)
 			}
 			for _, statement := range []string{backend.statements.acquireExisting, backend.statements.acquireNew, backend.statements.renew, backend.statements.release} {
 				if !strings.Contains(statement, "routine_id") {
@@ -256,6 +266,27 @@ func TestSQLLeaseSupportsKnownDialects(t *testing.T) {
 				t.Fatalf("log prune %q retains records per status instead of per name", backend.logs.prune)
 			}
 		})
+	}
+}
+
+func TestTTLSecondsRoundsUp(t *testing.T) {
+	tests := []struct {
+		ttl   time.Duration
+		want  int64
+		valid bool
+	}{
+		{ttl: -time.Nanosecond},
+		{ttl: 0},
+		{ttl: time.Nanosecond, want: 1, valid: true},
+		{ttl: time.Second, want: 1, valid: true},
+		{ttl: time.Second + time.Nanosecond, want: 2, valid: true},
+	}
+
+	for _, test := range tests {
+		got, valid := ttlSeconds(test.ttl)
+		if got != test.want || valid != test.valid {
+			t.Errorf("ttlSeconds(%s) = (%d, %t), want (%d, %t)", test.ttl, got, valid, test.want, test.valid)
+		}
 	}
 }
 
@@ -323,7 +354,7 @@ func TestSQLLeaseAcquiresExpiredLeaseWithUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	state := leaseState{Name: "reports", Owner: "worker-1", TTL: time.Microsecond + time.Nanosecond, Status: RoutineNotStarted}
+	state := leaseState{Name: "reports", Owner: "worker-1", TTL: time.Second + time.Nanosecond, Status: RoutineNotStarted}
 	if !backend.acquireState(context.Background(), state, 2) {
 		t.Fatal("expected lease acquisition")
 	}
@@ -342,13 +373,13 @@ func TestSQLLeaseAcquiresMissingLeaseWithInsert(t *testing.T) {
 	}
 
 	state := leaseState{Name: "reports", Owner: "worker-1", TTL: time.Second, Status: RoutineNotStarted}
-	if !backend.acquireState(context.Background(), state, int64(time.Second/time.Microsecond)) {
+	if !backend.acquireState(context.Background(), state, 1) {
 		t.Fatal("expected lease acquisition")
 	}
 	assertSQLCall(t, executor.calls, 0, mySQLLeaseStatements.acquireExisting,
-		"reports", "worker-1", int64(time.Second/time.Microsecond), string(RoutineNotStarted), int64(0), int64(0), "", routineID("reports"))
+		"reports", "worker-1", int64(1), string(RoutineNotStarted), int64(0), int64(0), "", routineID("reports"))
 	assertSQLCall(t, executor.calls, 1, mySQLLeaseStatements.acquireNew,
-		routineID("reports"), "reports", "worker-1", int64(time.Second/time.Microsecond), string(RoutineNotStarted), int64(0), int64(0), "")
+		routineID("reports"), "reports", "worker-1", int64(1), string(RoutineNotStarted), int64(0), int64(0), "")
 }
 
 func TestSQLLeaseReturnsFalseWhenInsertLosesRace(t *testing.T) {
@@ -359,7 +390,7 @@ func TestSQLLeaseReturnsFalseWhenInsertLosesRace(t *testing.T) {
 	}
 
 	state := leaseState{Name: "reports", Owner: "worker-1", TTL: time.Second, Status: RoutineNotStarted}
-	if backend.acquireState(context.Background(), state, int64(time.Second/time.Microsecond)) {
+	if backend.acquireState(context.Background(), state, 1) {
 		t.Fatal("acquired lease after insert lost its race")
 	}
 }
@@ -372,7 +403,7 @@ func TestSQLLeaseDoesNotInsertAfterUpdateFailure(t *testing.T) {
 	}
 
 	state := leaseState{Name: "reports", Owner: "worker-1", TTL: time.Second, Status: RoutineNotStarted}
-	if backend.acquireState(context.Background(), state, int64(time.Second/time.Microsecond)) {
+	if backend.acquireState(context.Background(), state, 1) {
 		t.Fatal("acquired lease after update failure")
 	}
 	if len(executor.calls) != 1 {
@@ -424,7 +455,7 @@ func TestSQLLeaseActionRetriesRenewalAfterExecutionError(t *testing.T) {
 	if !backend.Action(context.Background(), LeaseRenew, state) {
 		t.Fatal("renewal retry did not succeed")
 	}
-	wantArgs := []any{int64(time.Second / time.Microsecond), string(RoutineRunning), int64(0), int64(0), "", routineID("reports"), "worker-1"}
+	wantArgs := []any{int64(1), string(RoutineRunning), int64(0), int64(0), "", routineID("reports"), "worker-1"}
 	assertSQLCall(t, executor.calls, 0, postgreSQLLeaseStatements.renew, wantArgs...)
 	assertSQLCall(t, executor.calls, 1, postgreSQLLeaseStatements.renew, wantArgs...)
 	if len(executor.calls) != 2 {
@@ -499,7 +530,7 @@ func TestSQLLeaseActionDoesNotRecordRenewal(t *testing.T) {
 		t.Fatal("expected lease action to succeed")
 	}
 	assertSQLCall(t, executor.calls, 0, postgreSQLLeaseStatements.renew,
-		int64(time.Second/time.Microsecond), string(RoutineRunning), int64(4), int64(2), "processing", routineID("reports"), "worker-1")
+		int64(1), string(RoutineRunning), int64(4), int64(2), "processing", routineID("reports"), "worker-1")
 	if len(executor.calls) != 1 {
 		t.Fatalf("SQL calls = %d, want only renewal update", len(executor.calls))
 	}
@@ -514,7 +545,7 @@ func TestSQLLeaseActionValidatesTTLOnce(t *testing.T) {
 	validationCalls := 0
 	backend.statements.ttlArgument = func(ttl time.Duration) (int64, bool) {
 		validationCalls++
-		return microseconds(ttl)
+		return ttlSeconds(ttl)
 	}
 	state := leaseState{
 		Name:   "reports",
@@ -542,7 +573,7 @@ func TestSQLLeaseActionDispatchesAcquireAndRelease(t *testing.T) {
 			action:    LeaseAcquire,
 			status:    RoutineNotStarted,
 			wantQuery: postgreSQLLeaseStatements.acquireExisting,
-			wantArgs:  []any{"reports", "worker-1", int64(time.Second / time.Microsecond), string(RoutineNotStarted), int64(0), int64(0), "", routineID("reports")},
+			wantArgs:  []any{"reports", "worker-1", int64(1), string(RoutineNotStarted), int64(0), int64(0), "", routineID("reports")},
 		},
 		{
 			action:    LeaseRelease,
@@ -631,6 +662,27 @@ func TestSQLLeaseActionKeepsOwnershipResultWhenLoggingFails(t *testing.T) {
 	}
 }
 
+func TestSQLLeaseActionKeepsOwnershipResultWhenLoggingPanics(t *testing.T) {
+	executor := &scriptedSQLExecer{steps: []sqlExecStep{{rows: 1}, {panicValue: "log unavailable"}}}
+	backend, err := newSQLLease(executor, SQLSQLite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := leaseState{
+		Name:   "reports",
+		Owner:  "worker-1",
+		TTL:    time.Second,
+		Status: RoutineNotStarted,
+	}
+
+	if !backend.Action(context.Background(), LeaseAcquire, state) {
+		t.Fatal("log panic changed a successful ownership result")
+	}
+	if len(executor.calls) != 2 {
+		t.Fatalf("SQL calls = %d, want acquire and panicking log insert", len(executor.calls))
+	}
+}
+
 func TestSQLLeaseActionDoesNotLogFailedOwnershipOperation(t *testing.T) {
 	executor := &scriptedSQLExecer{steps: []sqlExecStep{{rows: 0}}}
 	backend, err := newSQLLease(executor, SQLSQLite)
@@ -654,15 +706,17 @@ func TestSQLLeaseActionDoesNotLogFailedOwnershipOperation(t *testing.T) {
 
 func TestSQLLeaseGetLogsFiltersNamesAndReturnsNewestFirst(t *testing.T) {
 	columns := []string{"id", "name", "owner", "action", "status", "log", "created_at"}
-	newest := time.Date(2026, time.September, 10, 12, 0, 0, 123000000, time.FixedZone("db", 2*60*60))
+	newest := time.Date(2026, time.September, 10, 12, 0, 0, 0, time.UTC).Unix()
+	older := newest - int64(time.Hour/time.Second)
 	executor := &scriptedSQLExecer{querySteps: []sqlQueryStep{
 		{
 			columns: columns,
 			rows: [][]driver.Value{
 				{"log-2", "name2", "worker-2", "release", "panic", "boom", newest},
-				{"log-1", "name1", "worker-1", "renew", "running", nil, "2026-09-10T09:00:00Z"},
+				{"log-1", "name1", "worker-1", "renew", "running", nil, fmt.Sprint(older)},
 			},
 		},
+		{columns: []string{"routine_id"}, rows: [][]driver.Value{{routineID("name1")}}},
 		{columns: columns},
 	}}
 	db := sql.OpenDB(scriptedSQLConnector{executor: executor})
@@ -682,11 +736,14 @@ func TestSQLLeaseGetLogsFiltersNamesAndReturnsNewestFirst(t *testing.T) {
 	if logs[0].ID != "log-2" || logs[0].Action != LeaseRelease || logs[0].Status != RoutinePanic || logs[0].Log != "boom" {
 		t.Fatalf("newest log = %#v, want panic release", logs[0])
 	}
-	if logs[0].CreatedAt.Location() != time.UTC || !logs[0].CreatedAt.Equal(newest) {
-		t.Fatalf("created time = %v, want %v in UTC", logs[0].CreatedAt, newest)
+	if logs[0].CreatedAt != newest {
+		t.Fatalf("created time = %d, want %d", logs[0].CreatedAt, newest)
 	}
 	if logs[1].Log != "" {
 		t.Fatalf("nullable log = %q, want empty string", logs[1].Log)
+	}
+	if logs[1].CreatedAt != older {
+		t.Fatalf("older created time = %d, want %d", logs[1].CreatedAt, older)
 	}
 	filteredQuery := postgreSQLLogStatements.selectBase + ` WHERE "routine_id" IN ($1, $2)` + postgreSQLLogStatements.orderBy
 	assertSQLCall(t, executor.queryCalls, 0, filteredQuery, routineID("name1"), routineID("name2"))
@@ -694,17 +751,19 @@ func TestSQLLeaseGetLogsFiltersNamesAndReturnsNewestFirst(t *testing.T) {
 	if _, err := backend.GetLogs(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	assertSQLCall(t, executor.queryCalls, 1, postgreSQLLogStatements.selectBase+postgreSQLLogStatements.orderBy)
+	assertSQLCall(t, executor.queryCalls, 1, postgreSQLLogStatements.selectRoutineIDs)
+	allLogsQuery := postgreSQLLogStatements.selectBase + ` WHERE "routine_id" IN ($1)` + postgreSQLLogStatements.orderBy
+	assertSQLCall(t, executor.queryCalls, 2, allLogsQuery, routineID("name1"))
 }
 
 func TestSQLLeaseGetStatusesFiltersNames(t *testing.T) {
 	columns := []string{"name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at"}
-	expiresAt := time.Date(2026, time.September, 10, 12, 5, 0, 0, time.FixedZone("db", 2*60*60))
-	updatedAt := expiresAt.Add(-time.Minute)
+	expiresAt := time.Date(2026, time.September, 10, 12, 5, 0, 0, time.UTC).Unix()
+	updatedAt := expiresAt - int64(time.Minute/time.Second)
 	executor := &scriptedSQLExecer{querySteps: []sqlQueryStep{{
 		columns: columns,
 		rows: [][]driver.Value{{
-			"reports", "worker-1", "running", int64(3), int64(1), nil, expiresAt, updatedAt,
+			"reports", "worker-1", "running", int64(3), int64(1), nil, expiresAt, fmt.Sprint(updatedAt),
 		}},
 	}}}
 	db := sql.OpenDB(scriptedSQLConnector{executor: executor})
@@ -725,11 +784,11 @@ func TestSQLLeaseGetStatusesFiltersNames(t *testing.T) {
 	if status.Name != "reports" || status.Owner != "worker-1" || status.Status != RoutineRunning || status.SuccessCount != 3 || status.FailureCount != 1 || status.Log != "" {
 		t.Fatalf("status = %#v, want current running state", status)
 	}
-	if !status.ExpiresAt.Equal(expiresAt) || status.ExpiresAt.Location() != time.UTC {
-		t.Fatalf("expiry = %v, want %v in UTC", status.ExpiresAt, expiresAt)
+	if status.ExpiresAt != expiresAt {
+		t.Fatalf("expiry = %d, want %d", status.ExpiresAt, expiresAt)
 	}
-	if !status.UpdatedAt.Equal(updatedAt) || status.UpdatedAt.Location() != time.UTC {
-		t.Fatalf("updated time = %v, want %v in UTC", status.UpdatedAt, updatedAt)
+	if status.UpdatedAt != updatedAt {
+		t.Fatalf("updated time = %d, want %d", status.UpdatedAt, updatedAt)
 	}
 	query := postgreSQLLeaseStatements.selectBase + ` WHERE "routine_id" IN ($1)` + postgreSQLLeaseStatements.orderBy
 	assertSQLCall(t, executor.queryCalls, 0, query, routineID("reports"))
@@ -742,15 +801,15 @@ func TestSQLLeaseGetLogsDeduplicatesAndBatchesNames(t *testing.T) {
 		{
 			columns: columns,
 			rows: [][]driver.Value{
-				{"log-a", "name-a", "worker-1", "renew", "running", nil, latest},
-				{"log-z", "name-z", "worker-1", "renew", "running", nil, latest.Add(-2 * time.Hour)},
+				{"log-a", "name-a", "worker-1", "renew", "running", nil, latest.Unix()},
+				{"log-z", "name-z", "worker-1", "renew", "running", nil, latest.Add(-2 * time.Hour).Unix()},
 			},
 		},
 		{
 			columns: columns,
 			rows: [][]driver.Value{
-				{"log-b", "name-b", "worker-2", "renew", "running", nil, latest},
-				{"log-c", "name-c", "worker-2", "renew", "running", nil, latest.Add(-time.Hour)},
+				{"log-b", "name-b", "worker-2", "renew", "running", nil, latest.Unix()},
+				{"log-c", "name-c", "worker-2", "renew", "running", nil, latest.Add(-time.Hour).Unix()},
 			},
 		},
 	}}
@@ -779,6 +838,37 @@ func TestSQLLeaseGetLogsDeduplicatesAndBatchesNames(t *testing.T) {
 	assertBatchedNameFilterCalls(t, executor.queryCalls, names)
 }
 
+func TestSQLLeaseGetLogsDiscoversAndBatchesAllRoutineIDs(t *testing.T) {
+	columns := []string{"id", "name", "owner", "action", "status", "log", "created_at"}
+	routineIDs := make([]string, sqlNameFilterBatchSize+1)
+	routineIDRows := make([][]driver.Value, len(routineIDs))
+	for index := range routineIDs {
+		routineIDs[index] = fmt.Sprintf("routine-id-%03d", index)
+		routineIDRows[index] = []driver.Value{routineIDs[index]}
+	}
+	executor := &scriptedSQLExecer{querySteps: []sqlQueryStep{
+		{columns: []string{"routine_id"}, rows: routineIDRows},
+		{columns: columns, rows: [][]driver.Value{{"log-a", "name-a", "worker-1", "acquire", "running", nil, int64(1)}}},
+		{columns: columns, rows: [][]driver.Value{{"log-b", "name-b", "worker-2", "release", "done", nil, int64(2)}}},
+	}}
+	db := sql.OpenDB(scriptedSQLConnector{executor: executor})
+	t.Cleanup(func() { _ = db.Close() })
+	backend, err := newSQLLease(db, SQLPostgreSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logs, err := backend.GetLogs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{logs[0].ID, logs[1].ID}; !reflect.DeepEqual(got, []string{"log-b", "log-a"}) {
+		t.Fatalf("ordered log IDs = %v, want global newest-first order", got)
+	}
+	assertSQLCall(t, executor.queryCalls, 0, postgreSQLLogStatements.selectRoutineIDs)
+	assertBatchedRoutineIDFilterCalls(t, executor.queryCalls[1:], routineIDs)
+}
+
 func TestSQLLeaseGetStatusesDeduplicatesAndBatchesNames(t *testing.T) {
 	columns := []string{"name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at"}
 	now := time.Date(2026, time.September, 10, 12, 0, 0, 0, time.UTC)
@@ -786,13 +876,13 @@ func TestSQLLeaseGetStatusesDeduplicatesAndBatchesNames(t *testing.T) {
 		{
 			columns: columns,
 			rows: [][]driver.Value{
-				{"zeta", "worker-1", "running", int64(1), int64(0), nil, now, now},
+				{"zeta", "worker-1", "running", int64(1), int64(0), nil, now.Unix(), now.Unix()},
 			},
 		},
 		{
 			columns: columns,
 			rows: [][]driver.Value{
-				{"alpha", "worker-2", "running", int64(1), int64(0), nil, now, now},
+				{"alpha", "worker-2", "running", int64(1), int64(0), nil, now.Unix(), now.Unix()},
 			},
 		},
 	}}
@@ -823,21 +913,27 @@ func TestSQLLeaseGetStatusesDeduplicatesAndBatchesNames(t *testing.T) {
 
 func assertBatchedNameFilterCalls(t *testing.T, calls []sqlExecCall, names []string) {
 	t.Helper()
+	routineIDs := uniqueRoutineIDs(names)
+	assertBatchedRoutineIDFilterCalls(t, calls, routineIDs)
+}
+
+func assertBatchedRoutineIDFilterCalls(t *testing.T, calls []sqlExecCall, routineIDs []string) {
+	t.Helper()
 	if len(calls) != 2 {
 		t.Fatalf("query calls = %d, want 2", len(calls))
 	}
 	if len(calls[0].args) != sqlNameFilterBatchSize || len(calls[1].args) != 1 {
 		t.Fatalf("query argument counts = %d and %d, want %d and 1", len(calls[0].args), len(calls[1].args), sqlNameFilterBatchSize)
 	}
-	if calls[0].args[0] != routineID(names[0]) || calls[1].args[0] != routineID(names[sqlNameFilterBatchSize]) {
-		t.Fatalf("query batches did not preserve unique name order")
+	if calls[0].args[0] != routineIDs[0] || calls[1].args[0] != routineIDs[sqlNameFilterBatchSize] {
+		t.Fatalf("query batches did not preserve routine ID order")
 	}
 	if strings.Contains(calls[1].query, "$2") {
 		t.Fatalf("second query did not reset bind variables: %q", calls[1].query)
 	}
 }
 
-func TestSQLLeaseRejectsInvalidActionAndLogQuery(t *testing.T) {
+func TestSQLLeaseRejectsInvalidAction(t *testing.T) {
 	executor := &scriptedSQLExecer{}
 	backend, err := newSQLLease(executor, SQLPostgreSQL)
 	if err != nil {
@@ -860,9 +956,6 @@ func TestSQLLeaseRejectsInvalidActionAndLogQuery(t *testing.T) {
 	if len(executor.calls) != 0 {
 		t.Fatalf("SQL calls = %d, want 0", len(executor.calls))
 	}
-	if _, err := backend.GetLogs(context.Background(), ""); err == nil {
-		t.Fatal("expected empty log name error")
-	}
 }
 
 func TestSQLLeaseUsesOracleStatementsAndBindings(t *testing.T) {
@@ -872,12 +965,12 @@ func TestSQLLeaseUsesOracleStatementsAndBindings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	acquireState := leaseState{Name: "reports", Owner: "worker-1", TTL: time.Microsecond + time.Nanosecond, Status: RoutineNotStarted}
+	acquireState := leaseState{Name: "reports", Owner: "worker-1", TTL: time.Second + time.Nanosecond, Status: RoutineNotStarted}
 	if !backend.acquireState(context.Background(), acquireState, 2) {
 		t.Fatal("expected Oracle lease acquisition")
 	}
 	renewState := leaseState{Name: "reports", Owner: "worker-1", TTL: time.Second, Status: RoutineRunning}
-	if !backend.renewState(context.Background(), renewState, int64(time.Second/time.Microsecond)) {
+	if !backend.renewState(context.Background(), renewState, 1) {
 		t.Fatal("expected Oracle lease renewal")
 	}
 	releaseState := leaseState{Name: "reports", Owner: "worker-1", Status: RoutineDone}
@@ -890,7 +983,7 @@ func TestSQLLeaseUsesOracleStatementsAndBindings(t *testing.T) {
 	assertSQLCall(t, executor.calls, 1, oracleLeaseStatements.acquireNew,
 		routineID("reports"), "reports", "worker-1", int64(2), string(RoutineNotStarted), int64(0), int64(0), "")
 	assertSQLCall(t, executor.calls, 2, oracleLeaseStatements.renew,
-		int64(time.Second/time.Microsecond), string(RoutineRunning), int64(0), int64(0), "", routineID("reports"), "worker-1")
+		int64(1), string(RoutineRunning), int64(0), int64(0), "", routineID("reports"), "worker-1")
 	assertSQLCall(t, executor.calls, 3, oracleLeaseStatements.release,
 		string(RoutineDone), int64(0), int64(0), "", routineID("reports"), "worker-1")
 }
@@ -911,7 +1004,6 @@ func TestSQLLeaseRejectsInvalidOperations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tooLong := (time.Duration(math.MaxInt32) + 1) * time.Second
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if backend.Action(canceledCtx, LeaseAcquire, leaseState{Name: "reports", Owner: "worker-1", TTL: time.Second, Status: RoutineNotStarted}) {
@@ -922,9 +1014,6 @@ func TestSQLLeaseRejectsInvalidOperations(t *testing.T) {
 	}
 	if backend.Action(context.Background(), LeaseRenew, leaseState{Name: "reports", Owner: "worker-1", Status: RoutineRunning}) {
 		t.Fatal("renewed lease with zero TTL")
-	}
-	if backend.Action(context.Background(), LeaseRenew, leaseState{Name: "reports", Owner: "worker-1", TTL: tooLong, Status: RoutineRunning}) {
-		t.Fatal("renewed SQL Server lease with unsupported TTL")
 	}
 	if backend.Action(context.Background(), LeaseRelease, leaseState{Name: "reports", Status: RoutineDone}) {
 		t.Fatal("released lease without owner")

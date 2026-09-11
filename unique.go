@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 )
@@ -19,6 +20,7 @@ const (
 var (
 	coordinatorMu      sync.RWMutex
 	defaultCoordinator *coordinator
+	serverTag          = detectServerTag()
 )
 
 type leaseTiming struct {
@@ -59,8 +61,24 @@ func (s *supervisorState) snapshot(name, owner string, ttl time.Duration) leaseS
 		Status:       s.status,
 		SuccessCount: s.successCount,
 		FailureCount: s.failureCount,
-		Log:          s.log,
+		Log:          serverLog(s.log),
 	}
+}
+
+func detectServerTag() string {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		return "unknown"
+	}
+	return hostname
+}
+
+func serverLog(message string) string {
+	prefix := "[" + serverTag + "]"
+	if message == "" {
+		return prefix
+	}
+	return prefix + "\n" + message
 }
 
 func (s *supervisorState) notStarted() {
@@ -134,7 +152,8 @@ func initLease(backend leaseProvider) error {
 // Supervision continues until ctx is canceled or Stop is called.
 // The context, task, and panic handler are required. A negative repeat delay
 // is invalid. Invalid arguments are returned before a goroutine is started.
-// The task and panic handler must not call runtime.Goexit.
+// The task and panic handler must not call runtime.Goexit; if either does,
+// supervision stops without treating Goexit as a panic.
 // InitSQLLease must be called before StartUniqueSupervisor.
 func StartUniqueSupervisor(ctx context.Context, name string, run func(context.Context), onPanic SupervisorPanicHandler, repeatAfter time.Duration) (*Handle, error) {
 	if ctx == nil {
@@ -162,14 +181,13 @@ func StartUniqueSupervisor(ctx context.Context, name string, run func(context.Co
 	if configured == nil {
 		return nil, errors.New("lease provider is not initialized")
 	}
-	return configured.startUniqueSupervisor(ctx, name, uniqueTask{Run: run, RepeatAfter: repeatAfter}, onPanic)
+	return configured.startUniqueSupervisor(ctx, name, uniqueTask{Run: run, RepeatAfter: repeatAfter}, onPanic), nil
 }
 
-func (c *coordinator) startUniqueSupervisor(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) (*Handle, error) {
-	handle := startHandle(ctx, func(ctx context.Context) {
+func (c *coordinator) startUniqueSupervisor(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) *Handle {
+	return startHandle(ctx, func(ctx context.Context) {
 		c.run(ctx, name, task, onPanic)
 	})
-	return handle, nil
 }
 
 func (c *coordinator) run(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) {
@@ -228,6 +246,7 @@ func (c *coordinator) runAsOwner(ctx context.Context, name, owner string, task u
 		state.running()
 		attemptResult := make(chan taskAttemptResult, 1)
 		taskHandle := startHandle(ctx, func(ctx context.Context) {
+			defer close(attemptResult)
 			recovered, panicked := runTaskAttempt(ctx, task.Run)
 			attemptResult <- taskAttemptResult{recovered: recovered, panicked: panicked}
 		})
@@ -237,7 +256,11 @@ func (c *coordinator) runAsOwner(ctx context.Context, name, owner string, task u
 			state.done(false)
 			return true, nil
 		case <-taskHandle.Done():
-			result := <-attemptResult
+			result, completed := <-attemptResult
+			if !completed {
+				state.done(false)
+				return true, nil
+			}
 			if ctx.Err() != nil {
 				state.done(false)
 				return true, nil
