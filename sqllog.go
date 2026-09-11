@@ -25,7 +25,6 @@ type sqlLogStatements struct {
 	selectRoutineIDs string
 	selectBase       string
 	routineIDColumn  string
-	orderBy          string
 	bindVariable     func(int) string
 }
 
@@ -52,9 +51,9 @@ func (s *sqlLease) Action(ctx context.Context, action LeaseAction, state leaseSt
 	return applied
 }
 
-// GetLogs returns retained records newest first. With no names it returns logs
-// for every task; otherwise it returns only records matching the supplied names.
-func (s *sqlLease) GetLogs(ctx context.Context, names ...string) ([]SupervisorLog, error) {
+// GetLogs returns retained records grouped by exact routine name. Each history
+// is ordered oldest first. With no names it returns logs for every task.
+func (s *sqlLease) GetLogs(ctx context.Context, names ...string) (SupervisorHistory, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
@@ -72,17 +71,16 @@ func (s *sqlLease) GetLogs(ctx context.Context, names ...string) ([]SupervisorLo
 			return nil, err
 		}
 	}
+	history := make(SupervisorHistory)
 	if len(routineIDs) == 0 {
-		return []SupervisorLog{}, nil
+		return history, nil
 	}
 
-	logs := make([]SupervisorLog, 0)
 	for start := 0; start < len(routineIDs); start += sqlNameFilterBatchSize {
 		end := min(start+sqlNameFilterBatchSize, len(routineIDs))
 		query, args := filteredSQLQuery(
 			s.logs.selectBase,
 			s.logs.routineIDColumn,
-			s.logs.orderBy,
 			s.logs.bindVariable,
 			routineIDs[start:end],
 		)
@@ -90,17 +88,17 @@ func (s *sqlLease) GetLogs(ctx context.Context, names ...string) ([]SupervisorLo
 		if err != nil {
 			return nil, err
 		}
-		logs = append(logs, batch...)
+		for name, logs := range batch {
+			history[name] = append(history[name], logs...)
+		}
 	}
-	if len(routineIDs) > sqlNameFilterBatchSize {
-		sort.Slice(logs, func(left, right int) bool {
-			if logs[left].CreatedAt == logs[right].CreatedAt {
-				return logs[left].ID > logs[right].ID
-			}
-			return logs[left].CreatedAt > logs[right].CreatedAt
+	for name := range history {
+		logs := history[name]
+		sort.SliceStable(logs, func(left, right int) bool {
+			return logs[left].CreatedAt < logs[right].CreatedAt
 		})
 	}
-	return logs, nil
+	return history, nil
 }
 
 func (s *sqlLease) queryLogRoutineIDs(ctx context.Context) ([]string, error) {
@@ -124,14 +122,14 @@ func (s *sqlLease) queryLogRoutineIDs(ctx context.Context) ([]string, error) {
 	return routineIDs, nil
 }
 
-func (s *sqlLease) queryLogs(ctx context.Context, query string, args []any) ([]SupervisorLog, error) {
+func (s *sqlLease) queryLogs(ctx context.Context, query string, args []any) (SupervisorHistory, error) {
 	rows, err := s.query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query supervisor logs: %w", err)
 	}
 	defer rows.Close()
 
-	logs := make([]SupervisorLog, 0)
+	history := make(SupervisorHistory)
 	for rows.Next() {
 		var (
 			log     SupervisorLog
@@ -153,17 +151,17 @@ func (s *sqlLease) queryLogs(ctx context.Context, query string, args []any) ([]S
 		log.Action = LeaseAction(action)
 		log.Status = RoutineStatus(status)
 		log.Log = logText.String
-		logs = append(logs, log)
+		history[log.Name] = append(history[log.Name], log)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate supervisor logs: %w", err)
 	}
-	return logs, nil
+	return history, nil
 }
 
-// GetStatuses returns one current state per task ordered by name. With no names
-// it returns every current state; otherwise it filters by the supplied names.
-func (s *sqlLease) GetStatuses(ctx context.Context, names ...string) ([]SupervisorStatus, error) {
+// GetStatuses returns one current state per exact routine name. With no names it
+// returns every current state; otherwise it filters by the supplied names.
+func (s *sqlLease) GetStatuses(ctx context.Context, names ...string) (SupervisorStatuses, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
@@ -176,16 +174,15 @@ func (s *sqlLease) GetStatuses(ctx context.Context, names ...string) ([]Supervis
 	routineIDs := uniqueRoutineIDs(names)
 
 	if len(routineIDs) == 0 {
-		return s.queryStatuses(ctx, s.statements.selectBase+s.statements.orderBy, nil)
+		return s.queryStatuses(ctx, s.statements.selectBase, nil)
 	}
 
-	statuses := make([]SupervisorStatus, 0, len(routineIDs))
+	statuses := make(SupervisorStatuses, len(routineIDs))
 	for start := 0; start < len(routineIDs); start += sqlNameFilterBatchSize {
 		end := min(start+sqlNameFilterBatchSize, len(routineIDs))
 		query, args := filteredSQLQuery(
 			s.statements.selectBase,
 			s.statements.routineIDColumn,
-			s.statements.orderBy,
 			s.statements.bindVariable,
 			routineIDs[start:end],
 		)
@@ -193,24 +190,21 @@ func (s *sqlLease) GetStatuses(ctx context.Context, names ...string) ([]Supervis
 		if err != nil {
 			return nil, err
 		}
-		statuses = append(statuses, batch...)
-	}
-	if len(routineIDs) > sqlNameFilterBatchSize {
-		sort.Slice(statuses, func(left, right int) bool {
-			return statuses[left].Name < statuses[right].Name
-		})
+		for name, status := range batch {
+			statuses[name] = status
+		}
 	}
 	return statuses, nil
 }
 
-func (s *sqlLease) queryStatuses(ctx context.Context, query string, args []any) ([]SupervisorStatus, error) {
+func (s *sqlLease) queryStatuses(ctx context.Context, query string, args []any) (SupervisorStatuses, error) {
 	rows, err := s.query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query supervisor statuses: %w", err)
 	}
 	defer rows.Close()
 
-	statuses := make([]SupervisorStatus, 0)
+	statuses := make(SupervisorStatuses)
 	for rows.Next() {
 		var (
 			status     SupervisorStatus
@@ -231,7 +225,7 @@ func (s *sqlLease) queryStatuses(ctx context.Context, query string, args []any) 
 		}
 		status.Status = RoutineStatus(statusName)
 		status.Log = logText.String
-		statuses = append(statuses, status)
+		statuses[status.Name] = status
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate supervisor statuses: %w", err)
@@ -257,14 +251,14 @@ func uniqueRoutineIDs(names []string) []string {
 	return routineIDs
 }
 
-func filteredSQLQuery(selectBase, routineIDColumn, orderBy string, bindVariable func(int) string, routineIDs []string) (string, []any) {
+func filteredSQLQuery(selectBase, routineIDColumn string, bindVariable func(int) string, routineIDs []string) (string, []any) {
 	variables := make([]string, len(routineIDs))
 	args := make([]any, len(routineIDs))
 	for index, id := range routineIDs {
 		variables[index] = bindVariable(index + 1)
 		args[index] = id
 	}
-	query := selectBase + " WHERE " + routineIDColumn + " IN (" + strings.Join(variables, ", ") + ")" + orderBy
+	query := selectBase + " WHERE " + routineIDColumn + " IN (" + strings.Join(variables, ", ") + ")"
 	return query, args
 }
 
@@ -367,10 +361,9 @@ WHERE "id" IN (
     ) AS "ranked"
 		WHERE "row_number" > %d
 	)`, retainedLogsPerRoutineID),
-	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "unique_routine_log" ORDER BY "routine_id"`,
+	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "unique_routine_log"`,
 	selectBase:       `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
 	routineIDColumn:  `"routine_id"`,
-	orderBy:          ` ORDER BY "created_at" DESC, "id" DESC`,
 	bindVariable:     dollarVariable,
 }
 
@@ -397,10 +390,9 @@ WHERE `+"`id`"+` IN (
     ) AS `+"`ranked`"+`
 		WHERE `+"`row_number`"+` > %d
 	)`, retainedLogsPerRoutineID),
-	selectRoutineIDs: `SELECT DISTINCT ` + "`routine_id`" + ` FROM ` + "`unique_routine_log`" + ` ORDER BY ` + "`routine_id`",
+	selectRoutineIDs: `SELECT DISTINCT ` + "`routine_id`" + ` FROM ` + "`unique_routine_log`",
 	selectBase:       `SELECT ` + "`id`" + `, ` + "`name`" + `, ` + "`owner`" + `, ` + "`action`" + `, ` + "`status`" + `, ` + "`log`" + `, ` + "`created_at`" + ` FROM ` + "`unique_routine_log`",
 	routineIDColumn:  "`routine_id`",
-	orderBy:          ` ORDER BY ` + "`created_at`" + ` DESC, ` + "`id`" + ` DESC`,
 	bindVariable:     questionVariable,
 }
 
@@ -427,10 +419,9 @@ WHERE "id" IN (
     ) AS "ranked"
 		WHERE "row_number" > %d
 	)`, retainedLogsPerRoutineID),
-	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "unique_routine_log" ORDER BY "routine_id"`,
+	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "unique_routine_log"`,
 	selectBase:       `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
 	routineIDColumn:  `"routine_id"`,
-	orderBy:          ` ORDER BY "created_at" DESC, "id" DESC`,
 	bindVariable:     questionVariable,
 }
 
@@ -479,10 +470,9 @@ WHERE [id] IN (
     ) AS [ranked]
 		WHERE [row_number] > %d
 	)`, retainedLogsPerRoutineID),
-	selectRoutineIDs: `SELECT DISTINCT [routine_id] FROM [unique_routine_log] ORDER BY [routine_id]`,
+	selectRoutineIDs: `SELECT DISTINCT [routine_id] FROM [unique_routine_log]`,
 	selectBase:       `SELECT [id], [name], [owner], [action], [status], [log], [created_at] FROM [unique_routine_log]`,
 	routineIDColumn:  `[routine_id]`,
-	orderBy:          ` ORDER BY [created_at] DESC, [id] DESC`,
 	bindVariable:     sqlServerVariable,
 }
 
@@ -528,9 +518,8 @@ WHERE "id" IN (
     )
 		WHERE "row_number" > %d
 	)`, retainedLogsPerRoutineID),
-	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "unique_routine_log" ORDER BY "routine_id"`,
+	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "unique_routine_log"`,
 	selectBase:       `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
 	routineIDColumn:  `"routine_id"`,
-	orderBy:          ` ORDER BY "created_at" DESC, "id" DESC`,
 	bindVariable:     oracleVariable,
 }

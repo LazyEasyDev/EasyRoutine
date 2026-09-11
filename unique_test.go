@@ -2,6 +2,7 @@ package EasyRoutine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"runtime"
@@ -70,8 +71,8 @@ type recordingLease struct {
 
 type logQueryLease struct {
 	memoryLease
-	logs        []SupervisorLog
-	statuses    []SupervisorStatus
+	logs        SupervisorHistory
+	statuses    SupervisorStatuses
 	names       []string
 	statusNames []string
 }
@@ -80,22 +81,22 @@ type panicLogLease struct {
 	memoryLease
 }
 
-func (*panicLogLease) GetLogs(context.Context, ...string) ([]SupervisorLog, error) {
+func (*panicLogLease) GetLogs(context.Context, ...string) (SupervisorHistory, error) {
 	panic("log query failed")
 }
 
-func (*panicLogLease) GetStatuses(context.Context, ...string) ([]SupervisorStatus, error) {
+func (*panicLogLease) GetStatuses(context.Context, ...string) (SupervisorStatuses, error) {
 	panic("status query failed")
 }
 
-func (l *logQueryLease) GetLogs(_ context.Context, names ...string) ([]SupervisorLog, error) {
+func (l *logQueryLease) GetLogs(_ context.Context, names ...string) (SupervisorHistory, error) {
 	l.names = append([]string(nil), names...)
-	return append([]SupervisorLog(nil), l.logs...), nil
+	return l.logs, nil
 }
 
-func (l *logQueryLease) GetStatuses(_ context.Context, names ...string) ([]SupervisorStatus, error) {
+func (l *logQueryLease) GetStatuses(_ context.Context, names ...string) (SupervisorStatuses, error) {
 	l.statusNames = append([]string(nil), names...)
-	return append([]SupervisorStatus(nil), l.statuses...), nil
+	return l.statuses, nil
 }
 
 func (r *recordingLease) Action(ctx context.Context, action LeaseAction, state leaseState) bool {
@@ -230,27 +231,27 @@ func (m *memoryLease) Action(_ context.Context, action LeaseAction, state leaseS
 	}
 }
 
-func (*memoryLease) GetLogs(context.Context, ...string) ([]SupervisorLog, error) {
+func (*memoryLease) GetLogs(context.Context, ...string) (SupervisorHistory, error) {
 	return nil, nil
 }
 
-func (*memoryLease) GetStatuses(context.Context, ...string) ([]SupervisorStatus, error) {
+func (*memoryLease) GetStatuses(context.Context, ...string) (SupervisorStatuses, error) {
 	return nil, nil
 }
 
-func (*panicAcquireLease) GetLogs(context.Context, ...string) ([]SupervisorLog, error) {
+func (*panicAcquireLease) GetLogs(context.Context, ...string) (SupervisorHistory, error) {
 	return nil, nil
 }
 
-func (*panicAcquireLease) GetStatuses(context.Context, ...string) ([]SupervisorStatus, error) {
+func (*panicAcquireLease) GetStatuses(context.Context, ...string) (SupervisorStatuses, error) {
 	return nil, nil
 }
 
-func (panicReleaseLease) GetLogs(context.Context, ...string) ([]SupervisorLog, error) {
+func (panicReleaseLease) GetLogs(context.Context, ...string) (SupervisorHistory, error) {
 	return nil, nil
 }
 
-func (panicReleaseLease) GetStatuses(context.Context, ...string) ([]SupervisorStatus, error) {
+func (panicReleaseLease) GetStatuses(context.Context, ...string) (SupervisorStatuses, error) {
 	return nil, nil
 }
 
@@ -907,9 +908,50 @@ func TestValidateRoutineName(t *testing.T) {
 	}
 }
 
+func TestSupervisorQueryResultsJSON(t *testing.T) {
+	statuses := SupervisorStatuses{
+		"reports": {Name: "reports", Status: RoutineRunning},
+	}
+	encodedStatuses, err := statuses.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decodedStatuses map[string]SupervisorStatus
+	if err := json.Unmarshal(encodedStatuses, &decodedStatuses); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decodedStatuses, map[string]SupervisorStatus(statuses)) {
+		t.Fatalf("decoded statuses = %#v, want %#v", decodedStatuses, statuses)
+	}
+
+	history := SupervisorHistory{
+		"reports": {{ID: "log-1", Name: "reports", CreatedAt: 1}},
+	}
+	encodedHistory, err := history.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decodedHistory map[string][]SupervisorLog
+	if err := json.Unmarshal(encodedHistory, &decodedHistory); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decodedHistory, map[string][]SupervisorLog(history)) {
+		t.Fatalf("decoded history = %#v, want %#v", decodedHistory, history)
+	}
+
+	var emptyStatuses SupervisorStatuses
+	if encoded, err := emptyStatuses.JSON(); err != nil || string(encoded) != "{}" {
+		t.Fatalf("empty statuses JSON = %q, %v, want {}", encoded, err)
+	}
+	var emptyHistory SupervisorHistory
+	if encoded, err := emptyHistory.JSON(); err != nil || string(encoded) != "{}" {
+		t.Fatalf("empty history JSON = %q, %v, want {}", encoded, err)
+	}
+}
+
 func TestGetLogsUsesInitializedBackend(t *testing.T) {
 	resetDefaultCoordinator(t)
-	want := []SupervisorLog{{ID: "log-1", Name: "reports"}}
+	want := SupervisorHistory{"reports": {{ID: "log-1", Name: "reports"}}}
 	backend := &logQueryLease{logs: want}
 	if err := initLease(backend); err != nil {
 		t.Fatal(err)
@@ -936,7 +978,7 @@ func TestGetLogsUsesInitializedBackend(t *testing.T) {
 
 func TestGetStatusesUsesInitializedBackend(t *testing.T) {
 	resetDefaultCoordinator(t)
-	want := []SupervisorStatus{{Name: "reports", Status: RoutineRunning}}
+	want := SupervisorStatuses{"reports": {Name: "reports", Status: RoutineRunning}}
 	backend := &logQueryLease{statuses: want}
 	if err := initLease(backend); err != nil {
 		t.Fatal(err)

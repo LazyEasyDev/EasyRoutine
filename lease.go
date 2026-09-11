@@ -2,6 +2,7 @@ package EasyRoutine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -73,6 +74,31 @@ type SupervisorStatus struct {
 	UpdatedAt int64
 }
 
+// SupervisorStatuses maps each exact routine name to its current state.
+type SupervisorStatuses map[string]SupervisorStatus
+
+// JSON returns the statuses encoded as a JSON object. A nil map is encoded as
+// an empty object.
+func (s SupervisorStatuses) JSON() ([]byte, error) {
+	if s == nil {
+		s = SupervisorStatuses{}
+	}
+	return json.Marshal(s)
+}
+
+// SupervisorHistory maps each exact routine name to its retained history.
+// Each history slice is ordered from oldest to newest.
+type SupervisorHistory map[string][]SupervisorLog
+
+// JSON returns the history encoded as a JSON object. A nil map is encoded as
+// an empty object.
+func (h SupervisorHistory) JSON() ([]byte, error) {
+	if h == nil {
+		h = SupervisorHistory{}
+	}
+	return json.Marshal(h)
+}
+
 func validateRoutineName(name string) error {
 	if name == "" {
 		return errors.New("task name is required")
@@ -106,16 +132,17 @@ func validateRoutineName(name string) error {
 // Methods must return promptly after ctx is canceled.
 // Action's result describes only the ownership change; log persistence must not
 // change a successful result to false. Query methods with no names return all
-// records. GetLogs returns records newest first.
+// records. GetLogs groups records by exact routine name and orders each history
+// from oldest to newest.
 type leaseProvider interface {
 	Action(ctx context.Context, action LeaseAction, state leaseState) bool
-	GetStatuses(ctx context.Context, names ...string) ([]SupervisorStatus, error)
-	GetLogs(ctx context.Context, names ...string) ([]SupervisorLog, error)
+	GetStatuses(ctx context.Context, names ...string) (SupervisorStatuses, error)
+	GetLogs(ctx context.Context, names ...string) (SupervisorHistory, error)
 }
 
-// GetStatuses returns the current supervisor states ordered by name for all
-// tasks or only the supplied names.
-func GetStatuses(ctx context.Context, names ...string) (statuses []SupervisorStatus, err error) {
+// GetStatuses returns current supervisor states keyed by exact routine name for
+// all tasks or only the supplied names.
+func GetStatuses(ctx context.Context, names ...string) (statuses SupervisorStatuses, err error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
@@ -144,9 +171,9 @@ func GetStatuses(ctx context.Context, names ...string) (statuses []SupervisorSta
 	return configured.backend.GetStatuses(ctx, names...)
 }
 
-// GetLogs returns retained supervisor logs newest first for all names or only
-// the supplied names.
-func GetLogs(ctx context.Context, names ...string) (logs []SupervisorLog, err error) {
+// GetLogs returns retained supervisor logs grouped by exact routine name for
+// all names or only the supplied names. Each history is ordered oldest first.
+func GetLogs(ctx context.Context, names ...string) (logs SupervisorHistory, err error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}

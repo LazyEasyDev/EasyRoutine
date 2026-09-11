@@ -7,10 +7,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
 const sqlRenewRetryDelay = 10 * time.Second
+
+var sqlLeaseInitMu sync.Mutex
 
 // SQLDialect identifies a database compatibility target.
 type SQLDialect string
@@ -49,7 +52,6 @@ type sqlLeaseStatements struct {
 	ttlArgument     func(time.Duration) (int64, bool)
 	selectBase      string
 	routineIDColumn string
-	orderBy         string
 	bindVariable    func(int) string
 }
 
@@ -61,6 +63,16 @@ func InitSQLLease(ctx context.Context, db *sql.DB, dialect SQLDialect) error {
 	}
 	if db == nil {
 		return errors.New("SQL database is required")
+	}
+
+	sqlLeaseInitMu.Lock()
+	defer sqlLeaseInitMu.Unlock()
+
+	coordinatorMu.RLock()
+	initialized := defaultCoordinator != nil
+	coordinatorMu.RUnlock()
+	if initialized {
+		return errors.New("lease provider is already initialized")
 	}
 
 	backend, err := newSQLLease(db, dialect)
@@ -253,7 +265,6 @@ WHERE "routine_id" = $5 AND "owner" = $6`,
 	ttlArgument:     ttlSeconds,
 	selectBase:      `SELECT "name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at" FROM "unique_routine"`,
 	routineIDColumn: `"routine_id"`,
-	orderBy:         ` ORDER BY "name"`,
 	bindVariable:    dollarVariable,
 }
 
@@ -302,7 +313,6 @@ WHERE ` + "`routine_id`" + ` = ? AND ` + "`owner`" + ` = ?`,
 	ttlArgument:     ttlSeconds,
 	selectBase:      `SELECT ` + "`name`" + `, ` + "`owner`" + `, ` + "`status`" + `, ` + "`success_count`" + `, ` + "`failure_count`" + `, ` + "`log`" + `, ` + "`expires_at`" + `, ` + "`updated_at`" + ` FROM ` + "`unique_routine`",
 	routineIDColumn: "`routine_id`",
-	orderBy:         ` ORDER BY ` + "`name`",
 	bindVariable:    questionVariable,
 }
 
@@ -351,7 +361,6 @@ WHERE "routine_id" = ? AND "owner" = ?`,
 	ttlArgument:     ttlSeconds,
 	selectBase:      `SELECT "name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at" FROM "unique_routine"`,
 	routineIDColumn: `"routine_id"`,
-	orderBy:         ` ORDER BY "name"`,
 	bindVariable:    questionVariable,
 }
 
@@ -409,7 +418,6 @@ WHERE [routine_id] = @p5 AND [owner] = @p6`,
 	ttlArgument:     ttlSeconds,
 	selectBase:      `SELECT [name], [owner], [status], [success_count], [failure_count], [log], [expires_at], [updated_at] FROM [unique_routine]`,
 	routineIDColumn: `[routine_id]`,
-	orderBy:         ` ORDER BY [name]`,
 	bindVariable:    sqlServerVariable,
 }
 
@@ -461,6 +469,5 @@ WHERE "routine_id" = :5 AND "owner" = :6`,
 	ttlArgument:     ttlSeconds,
 	selectBase:      `SELECT "name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at" FROM "unique_routine"`,
 	routineIDColumn: `"routine_id"`,
-	orderBy:         ` ORDER BY "name"`,
 	bindVariable:    oracleVariable,
 }

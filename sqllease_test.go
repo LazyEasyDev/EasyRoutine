@@ -256,6 +256,11 @@ func TestSQLLeaseSupportsKnownDialects(t *testing.T) {
 			if !strings.Contains(backend.statements.selectBase, "expires_at") || !strings.Contains(backend.statements.selectBase, "updated_at") {
 				t.Fatalf("status query %q does not select lease timestamps", backend.statements.selectBase)
 			}
+			for _, query := range []string{backend.statements.selectBase, backend.logs.selectRoutineIDs, backend.logs.selectBase} {
+				if strings.Contains(strings.ToUpper(query), "ORDER BY") {
+					t.Fatalf("retrieval query %q orders rows in SQL", query)
+				}
+			}
 			if !strings.Contains(backend.logs.insert, test.logClock) {
 				t.Fatalf("log insert %q does not contain database clock %q", backend.logs.insert, test.logClock)
 			}
@@ -316,6 +321,27 @@ func TestInitSQLLeaseEnsuresSchemaAndRegistersProvider(t *testing.T) {
 	}
 	if _, ok := defaultCoordinator.backend.(*sqlLease); !ok {
 		t.Fatalf("backend type = %T, want *sqlLease", defaultCoordinator.backend)
+	}
+}
+
+func TestInitSQLLeaseRejectsRepeatedInitializationBeforeSchema(t *testing.T) {
+	resetDefaultCoordinator(t)
+	firstExecutor := &scriptedSQLExecer{steps: []sqlExecStep{{}, {}, {}}}
+	firstDB := sql.OpenDB(scriptedSQLConnector{executor: firstExecutor})
+	t.Cleanup(func() { _ = firstDB.Close() })
+	if err := InitSQLLease(context.Background(), firstDB, SQLPostgreSQL); err != nil {
+		t.Fatal(err)
+	}
+
+	secondExecutor := &scriptedSQLExecer{}
+	secondDB := sql.OpenDB(scriptedSQLConnector{executor: secondExecutor})
+	t.Cleanup(func() { _ = secondDB.Close() })
+	err := InitSQLLease(context.Background(), secondDB, SQLPostgreSQL)
+	if err == nil || !strings.Contains(err.Error(), "already initialized") {
+		t.Fatalf("repeated initialization error = %v, want already initialized", err)
+	}
+	if len(secondExecutor.calls) != 0 {
+		t.Fatalf("second database received %d SQL calls, want 0", len(secondExecutor.calls))
 	}
 }
 
@@ -704,7 +730,7 @@ func TestSQLLeaseActionDoesNotLogFailedOwnershipOperation(t *testing.T) {
 	}
 }
 
-func TestSQLLeaseGetLogsFiltersNamesAndReturnsNewestFirst(t *testing.T) {
+func TestSQLLeaseGetLogsFiltersNamesAndGroupsHistory(t *testing.T) {
 	columns := []string{"id", "name", "owner", "action", "status", "log", "created_at"}
 	newest := time.Date(2026, time.September, 10, 12, 0, 0, 0, time.UTC).Unix()
 	older := newest - int64(time.Hour/time.Second)
@@ -731,28 +757,30 @@ func TestSQLLeaseGetLogsFiltersNamesAndReturnsNewestFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(logs) != 2 {
-		t.Fatalf("logs = %#v, want 2 records", logs)
+		t.Fatalf("history = %#v, want 2 names", logs)
 	}
-	if logs[0].ID != "log-2" || logs[0].Action != LeaseRelease || logs[0].Status != RoutinePanic || logs[0].Log != "boom" {
-		t.Fatalf("newest log = %#v, want panic release", logs[0])
+	name2 := logs["name2"]
+	if len(name2) != 1 || name2[0].ID != "log-2" || name2[0].Action != LeaseRelease || name2[0].Status != RoutinePanic || name2[0].Log != "boom" {
+		t.Fatalf("name2 history = %#v, want panic release", name2)
 	}
-	if logs[0].CreatedAt != newest {
-		t.Fatalf("created time = %d, want %d", logs[0].CreatedAt, newest)
+	if name2[0].CreatedAt != newest {
+		t.Fatalf("created time = %d, want %d", name2[0].CreatedAt, newest)
 	}
-	if logs[1].Log != "" {
-		t.Fatalf("nullable log = %q, want empty string", logs[1].Log)
+	name1 := logs["name1"]
+	if len(name1) != 1 || name1[0].Log != "" {
+		t.Fatalf("name1 history = %#v, want empty nullable log", name1)
 	}
-	if logs[1].CreatedAt != older {
-		t.Fatalf("older created time = %d, want %d", logs[1].CreatedAt, older)
+	if name1[0].CreatedAt != older {
+		t.Fatalf("older created time = %d, want %d", name1[0].CreatedAt, older)
 	}
-	filteredQuery := postgreSQLLogStatements.selectBase + ` WHERE "routine_id" IN ($1, $2)` + postgreSQLLogStatements.orderBy
+	filteredQuery := postgreSQLLogStatements.selectBase + ` WHERE "routine_id" IN ($1, $2)`
 	assertSQLCall(t, executor.queryCalls, 0, filteredQuery, routineID("name1"), routineID("name2"))
 
 	if _, err := backend.GetLogs(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	assertSQLCall(t, executor.queryCalls, 1, postgreSQLLogStatements.selectRoutineIDs)
-	allLogsQuery := postgreSQLLogStatements.selectBase + ` WHERE "routine_id" IN ($1)` + postgreSQLLogStatements.orderBy
+	allLogsQuery := postgreSQLLogStatements.selectBase + ` WHERE "routine_id" IN ($1)`
 	assertSQLCall(t, executor.queryCalls, 2, allLogsQuery, routineID("name1"))
 }
 
@@ -780,7 +808,7 @@ func TestSQLLeaseGetStatusesFiltersNames(t *testing.T) {
 	if len(statuses) != 1 {
 		t.Fatalf("statuses = %#v, want one current status", statuses)
 	}
-	status := statuses[0]
+	status := statuses["reports"]
 	if status.Name != "reports" || status.Owner != "worker-1" || status.Status != RoutineRunning || status.SuccessCount != 3 || status.FailureCount != 1 || status.Log != "" {
 		t.Fatalf("status = %#v, want current running state", status)
 	}
@@ -790,8 +818,37 @@ func TestSQLLeaseGetStatusesFiltersNames(t *testing.T) {
 	if status.UpdatedAt != updatedAt {
 		t.Fatalf("updated time = %d, want %d", status.UpdatedAt, updatedAt)
 	}
-	query := postgreSQLLeaseStatements.selectBase + ` WHERE "routine_id" IN ($1)` + postgreSQLLeaseStatements.orderBy
+	query := postgreSQLLeaseStatements.selectBase + ` WHERE "routine_id" IN ($1)`
 	assertSQLCall(t, executor.queryCalls, 0, query, routineID("reports"))
+}
+
+func TestSQLLeaseQueriesReturnEmptyMaps(t *testing.T) {
+	executor := &scriptedSQLExecer{querySteps: []sqlQueryStep{
+		{columns: []string{"routine_id"}},
+		{columns: []string{"name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at"}},
+	}}
+	db := sql.OpenDB(scriptedSQLConnector{executor: executor})
+	t.Cleanup(func() { _ = db.Close() })
+	backend, err := newSQLLease(db, SQLPostgreSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := backend.GetLogs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history == nil || len(history) != 0 {
+		t.Fatalf("history = %#v, want non-nil empty map", history)
+	}
+
+	statuses, err := backend.GetStatuses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statuses == nil || len(statuses) != 0 {
+		t.Fatalf("statuses = %#v, want non-nil empty map", statuses)
+	}
 }
 
 func TestSQLLeaseGetLogsDeduplicatesAndBatchesNames(t *testing.T) {
@@ -801,15 +858,15 @@ func TestSQLLeaseGetLogsDeduplicatesAndBatchesNames(t *testing.T) {
 		{
 			columns: columns,
 			rows: [][]driver.Value{
-				{"log-a", "name-a", "worker-1", "renew", "running", nil, latest.Unix()},
-				{"log-z", "name-z", "worker-1", "renew", "running", nil, latest.Add(-2 * time.Hour).Unix()},
+				{"log-a2", "name-a", "worker-1", "release", "done", nil, latest.Unix()},
+				{"log-z", "name-z", "worker-1", "release", "done", nil, latest.Add(-2 * time.Hour).Unix()},
 			},
 		},
 		{
 			columns: columns,
 			rows: [][]driver.Value{
-				{"log-b", "name-b", "worker-2", "renew", "running", nil, latest.Unix()},
-				{"log-c", "name-c", "worker-2", "renew", "running", nil, latest.Add(-time.Hour).Unix()},
+				{"log-a1", "name-a", "worker-2", "acquire", "not_started", nil, latest.Add(-time.Hour).Unix()},
+				{"log-b", "name-b", "worker-2", "release", "done", nil, latest.Unix()},
 			},
 		},
 	}}
@@ -829,11 +886,11 @@ func TestSQLLeaseGetLogsDeduplicatesAndBatchesNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(logs) != 4 {
-		t.Fatalf("logs = %#v, want 4 records", logs)
+	if len(logs) != 3 {
+		t.Fatalf("history = %#v, want 3 names", logs)
 	}
-	if got := []string{logs[0].ID, logs[1].ID, logs[2].ID, logs[3].ID}; !reflect.DeepEqual(got, []string{"log-b", "log-a", "log-c", "log-z"}) {
-		t.Fatalf("ordered log IDs = %v, want global newest-first order", got)
+	if got := []string{logs["name-a"][0].ID, logs["name-a"][1].ID}; !reflect.DeepEqual(got, []string{"log-a1", "log-a2"}) {
+		t.Fatalf("name-a log IDs = %v, want oldest-first history", got)
 	}
 	assertBatchedNameFilterCalls(t, executor.queryCalls, names)
 }
@@ -862,8 +919,8 @@ func TestSQLLeaseGetLogsDiscoversAndBatchesAllRoutineIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := []string{logs[0].ID, logs[1].ID}; !reflect.DeepEqual(got, []string{"log-b", "log-a"}) {
-		t.Fatalf("ordered log IDs = %v, want global newest-first order", got)
+	if logs["name-a"][0].ID != "log-a" || logs["name-b"][0].ID != "log-b" {
+		t.Fatalf("grouped history = %#v, want records keyed by name", logs)
 	}
 	assertSQLCall(t, executor.queryCalls, 0, postgreSQLLogStatements.selectRoutineIDs)
 	assertBatchedRoutineIDFilterCalls(t, executor.queryCalls[1:], routineIDs)
@@ -905,8 +962,8 @@ func TestSQLLeaseGetStatusesDeduplicatesAndBatchesNames(t *testing.T) {
 	if len(statuses) != 2 {
 		t.Fatalf("statuses = %#v, want 2 records", statuses)
 	}
-	if got := []string{statuses[0].Name, statuses[1].Name}; !reflect.DeepEqual(got, []string{"alpha", "zeta"}) {
-		t.Fatalf("ordered status names = %v, want global name order", got)
+	if statuses["alpha"].Name != "alpha" || statuses["zeta"].Name != "zeta" {
+		t.Fatalf("statuses = %#v, want states keyed by name", statuses)
 	}
 	assertBatchedNameFilterCalls(t, executor.queryCalls, names)
 }
