@@ -4,6 +4,15 @@ EasyRoutine manages background Go functions. Use `SafeGo` for local panic
 recovery. Use `StartUniqueSupervisor` when many processes may start the same
 task but only the process holding its SQL lease should run it.
 
+> [!WARNING]
+> `StartUniqueSupervisor` is best-effort coordination, not a strict singleton
+> or exactly-once guarantee. Long process pauses, network partitions, delayed
+> SQL responses, and lease expiration can allow an old task to overlap a new
+> owner. Do not rely on the lease alone to protect correctness-critical data.
+> Protect database changes with appropriately scoped transactions, row or
+> advisory locks, constraints, idempotency keys, or fencing tokens. Work may
+> execute more than once; its data mutations must remain correct when it does.
+
 | API | Purpose |
 | --- | --- |
 | `SafeGo` | Run local work with policy-controlled panic retries |
@@ -325,7 +334,20 @@ protocol.
 
 ## Distributed Safety
 
-A time-based lease coordinates one owner during normal operation, but it cannot
-prove that stale work stopped after a long process pause or network partition.
-Use idempotent side effects or a fencing mechanism when strict ordering is
-required.
+A time-based lease reduces duplicate execution during normal operation, but it
+cannot prove that stale work stopped before another process acquired an expired
+lease. Extreme scheduler pauses, network partitions, delayed SQL responses, or
+an unresponsive task can therefore produce overlapping or repeated work.
+
+Treat the lease as a scheduling mechanism, not as the final data-integrity
+boundary. For correctness-critical database changes, perform the protected
+read and write while holding an appropriate database row lock, advisory lock,
+or transaction, and enforce invariants with database constraints where
+possible. The lock must cover the protected mutation; acquiring and releasing
+it before the write does not provide protection.
+
+Database locks cannot make external side effects exactly once. Calls to queues,
+payment services, email providers, or other systems should use idempotency keys,
+deduplication, an outbox pattern, or fencing tokens. Design every task so a
+repeated attempt preserves correct data even when two executions briefly
+overlap.
