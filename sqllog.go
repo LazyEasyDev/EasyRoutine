@@ -6,11 +6,15 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
 
-const retainedLogsPerName = 25
+const retainedLogsPerRoutineID = 25
+
+// Keep each filter below Oracle's IN-list and older SQLite variable limits.
+const sqlNameFilterBatchSize = 900
 
 type sqlQueryContext func(context.Context, string, ...any) (*sql.Rows, error)
 
@@ -25,23 +29,24 @@ type sqlLogStatements struct {
 	bindVariable    func(int) string
 }
 
-// Action atomically applies ownership and current state, then records a
-// best-effort history snapshot. A log failure does not change the result.
-func (s *SQLLease) Action(ctx context.Context, action LeaseAction, state LeaseState) bool {
-	if !s.validAction(ctx, action, state) {
+// Action atomically applies ownership and current state. Acquire and release
+// actions also record a best-effort history snapshot.
+func (s *sqlLease) Action(ctx context.Context, action LeaseAction, state leaseState) bool {
+	ttlArgument, valid := s.validateAction(ctx, action, state)
+	if !valid {
 		return false
 	}
 
 	var applied bool
 	switch action {
 	case LeaseAcquire:
-		applied = s.acquireState(ctx, state)
+		applied = s.acquireState(ctx, state, ttlArgument)
 	case LeaseRenew:
-		applied = s.renewState(ctx, state)
+		applied = s.renewState(ctx, state, ttlArgument)
 	case LeaseRelease:
 		applied = s.releaseState(ctx, state)
 	}
-	if applied {
+	if applied && action != LeaseRenew {
 		s.recordLog(ctx, action, state)
 	}
 	return applied
@@ -49,7 +54,7 @@ func (s *SQLLease) Action(ctx context.Context, action LeaseAction, state LeaseSt
 
 // GetLogs returns retained records newest first. With no names it returns logs
 // for every task; otherwise it returns only records matching the supplied names.
-func (s *SQLLease) GetLogs(ctx context.Context, names ...string) ([]SupervisorLog, error) {
+func (s *sqlLease) GetLogs(ctx context.Context, names ...string) ([]SupervisorLog, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
@@ -59,24 +64,43 @@ func (s *SQLLease) GetLogs(ctx context.Context, names ...string) ([]SupervisorLo
 	if s == nil || s.db == nil || s.query == nil {
 		return nil, errors.New("SQL lease is not initialized")
 	}
-	for _, name := range names {
-		if err := validateRoutineName(name); err != nil {
+	routineIDs, err := uniqueRoutineIDs(names)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(routineIDs) == 0 {
+		return s.queryLogs(ctx, s.logs.selectBase+s.logs.orderBy, nil)
+	}
+
+	logs := make([]SupervisorLog, 0)
+	for start := 0; start < len(routineIDs); start += sqlNameFilterBatchSize {
+		end := min(start+sqlNameFilterBatchSize, len(routineIDs))
+		query, args := filteredSQLQuery(
+			s.logs.selectBase,
+			s.logs.routineIDColumn,
+			s.logs.orderBy,
+			s.logs.bindVariable,
+			routineIDs[start:end],
+		)
+		batch, err := s.queryLogs(ctx, query, args)
+		if err != nil {
 			return nil, err
 		}
+		logs = append(logs, batch...)
 	}
-
-	query := s.logs.selectBase
-	args := make([]any, len(names))
-	if len(names) > 0 {
-		variables := make([]string, len(names))
-		for index, name := range names {
-			variables[index] = s.logs.bindVariable(index + 1)
-			args[index] = routineID(name)
-		}
-		query += " WHERE " + s.logs.routineIDColumn + " IN (" + strings.Join(variables, ", ") + ")"
+	if len(routineIDs) > sqlNameFilterBatchSize {
+		sort.Slice(logs, func(left, right int) bool {
+			if logs[left].CreatedAt.Equal(logs[right].CreatedAt) {
+				return logs[left].ID > logs[right].ID
+			}
+			return logs[left].CreatedAt.After(logs[right].CreatedAt)
+		})
 	}
-	query += s.logs.orderBy
+	return logs, nil
+}
 
+func (s *sqlLease) queryLogs(ctx context.Context, query string, args []any) ([]SupervisorLog, error) {
 	rows, err := s.query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query supervisor logs: %w", err)
@@ -120,7 +144,7 @@ func (s *SQLLease) GetLogs(ctx context.Context, names ...string) ([]SupervisorLo
 
 // GetStatuses returns one current state per task ordered by name. With no names
 // it returns every current state; otherwise it filters by the supplied names.
-func (s *SQLLease) GetStatuses(ctx context.Context, names ...string) ([]SupervisorStatus, error) {
+func (s *sqlLease) GetStatuses(ctx context.Context, names ...string) ([]SupervisorStatus, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
@@ -130,24 +154,40 @@ func (s *SQLLease) GetStatuses(ctx context.Context, names ...string) ([]Supervis
 	if s == nil || s.db == nil || s.query == nil {
 		return nil, errors.New("SQL lease is not initialized")
 	}
-	for _, name := range names {
-		if err := validateRoutineName(name); err != nil {
+	routineIDs, err := uniqueRoutineIDs(names)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(routineIDs) == 0 {
+		return s.queryStatuses(ctx, s.statements.selectBase+s.statements.orderBy, nil)
+	}
+
+	statuses := make([]SupervisorStatus, 0, len(routineIDs))
+	for start := 0; start < len(routineIDs); start += sqlNameFilterBatchSize {
+		end := min(start+sqlNameFilterBatchSize, len(routineIDs))
+		query, args := filteredSQLQuery(
+			s.statements.selectBase,
+			s.statements.routineIDColumn,
+			s.statements.orderBy,
+			s.statements.bindVariable,
+			routineIDs[start:end],
+		)
+		batch, err := s.queryStatuses(ctx, query, args)
+		if err != nil {
 			return nil, err
 		}
+		statuses = append(statuses, batch...)
 	}
-
-	query := s.statements.selectBase
-	args := make([]any, len(names))
-	if len(names) > 0 {
-		variables := make([]string, len(names))
-		for index, name := range names {
-			variables[index] = s.statements.bindVariable(index + 1)
-			args[index] = routineID(name)
-		}
-		query += " WHERE " + s.statements.routineIDColumn + " IN (" + strings.Join(variables, ", ") + ")"
+	if len(routineIDs) > sqlNameFilterBatchSize {
+		sort.Slice(statuses, func(left, right int) bool {
+			return statuses[left].Name < statuses[right].Name
+		})
 	}
-	query += s.statements.orderBy
+	return statuses, nil
+}
 
+func (s *sqlLease) queryStatuses(ctx context.Context, query string, args []any) ([]SupervisorStatus, error) {
 	rows, err := s.query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query supervisor statuses: %w", err)
@@ -193,24 +233,58 @@ func (s *SQLLease) GetStatuses(ctx context.Context, names ...string) ([]Supervis
 	return statuses, nil
 }
 
-func (s *SQLLease) validAction(ctx context.Context, action LeaseAction, state LeaseState) bool {
+func uniqueRoutineIDs(names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+
+	routineIDs := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if err := validateRoutineName(name); err != nil {
+			return nil, err
+		}
+		id := routineID(name)
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		routineIDs = append(routineIDs, id)
+	}
+	return routineIDs, nil
+}
+
+func filteredSQLQuery(selectBase, routineIDColumn, orderBy string, bindVariable func(int) string, routineIDs []string) (string, []any) {
+	variables := make([]string, len(routineIDs))
+	args := make([]any, len(routineIDs))
+	for index, id := range routineIDs {
+		variables[index] = bindVariable(index + 1)
+		args[index] = id
+	}
+	query := selectBase + " WHERE " + routineIDColumn + " IN (" + strings.Join(variables, ", ") + ")" + orderBy
+	return query, args
+}
+
+func (s *sqlLease) validateAction(ctx context.Context, action LeaseAction, state leaseState) (int64, bool) {
 	if ctx == nil || ctx.Err() != nil || s == nil || s.db == nil || state.Owner == "" {
-		return false
+		return 0, false
 	}
 	if validateRoutineName(state.Name) != nil {
-		return false
+		return 0, false
 	}
 	if state.SuccessCount < 0 || state.FailureCount < 0 || !validRoutineStatus(state.Status) {
-		return false
+		return 0, false
 	}
 	switch action {
 	case LeaseAcquire, LeaseRenew:
-		_, ok := s.validLeaseArguments(ctx, state.Name, state.Owner, state.TTL)
-		return ok
+		if s.statements.ttlArgument == nil {
+			return 0, false
+		}
+		return s.statements.ttlArgument(state.TTL)
 	case LeaseRelease:
-		return true
+		return 0, true
 	default:
-		return false
+		return 0, false
 	}
 }
 
@@ -223,7 +297,7 @@ func validRoutineStatus(status RoutineStatus) bool {
 	}
 }
 
-func (s *SQLLease) recordLog(ctx context.Context, action LeaseAction, state LeaseState) {
+func (s *sqlLease) recordLog(ctx context.Context, action LeaseAction, state leaseState) {
 	_, err := s.db.ExecContext(
 		ctx,
 		s.logs.insert,
@@ -323,7 +397,7 @@ WHERE "id" IN (
 		WHERE "routine_id" = $1
     ) AS "ranked"
 		WHERE "row_number" > %d
-	)`, retainedLogsPerName),
+	)`, retainedLogsPerRoutineID),
 	selectBase:      `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
 	routineIDColumn: `"routine_id"`,
 	orderBy:         ` ORDER BY "created_at" DESC, "id" DESC`,
@@ -352,7 +426,7 @@ WHERE `+"`id`"+` IN (
 		WHERE `+"`routine_id`"+` = ?
     ) AS `+"`ranked`"+`
 		WHERE `+"`row_number`"+` > %d
-	)`, retainedLogsPerName),
+	)`, retainedLogsPerRoutineID),
 	selectBase:      `SELECT ` + "`id`" + `, ` + "`name`" + `, ` + "`owner`" + `, ` + "`action`" + `, ` + "`status`" + `, ` + "`log`" + `, ` + "`created_at`" + ` FROM ` + "`unique_routine_log`",
 	routineIDColumn: "`routine_id`",
 	orderBy:         ` ORDER BY ` + "`created_at`" + ` DESC, ` + "`id`" + ` DESC`,
@@ -381,7 +455,7 @@ WHERE "id" IN (
 		WHERE "routine_id" = ?
     ) AS "ranked"
 		WHERE "row_number" > %d
-	)`, retainedLogsPerName),
+	)`, retainedLogsPerRoutineID),
 	selectBase:      `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
 	routineIDColumn: `"routine_id"`,
 	orderBy:         ` ORDER BY "created_at" DESC, "id" DESC`,
@@ -432,7 +506,7 @@ WHERE [id] IN (
 		WHERE [routine_id] = @p1
     ) AS [ranked]
 		WHERE [row_number] > %d
-	)`, retainedLogsPerName),
+	)`, retainedLogsPerRoutineID),
 	selectBase:      `SELECT [id], [name], [owner], [action], [status], [log], [created_at] FROM [unique_routine_log]`,
 	routineIDColumn: `[routine_id]`,
 	orderBy:         ` ORDER BY [created_at] DESC, [id] DESC`,
@@ -480,7 +554,7 @@ WHERE "id" IN (
 		WHERE "routine_id" = :1
     )
 		WHERE "row_number" > %d
-	)`, retainedLogsPerName),
+	)`, retainedLogsPerRoutineID),
 	selectBase:      `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "unique_routine_log"`,
 	routineIDColumn: `"routine_id"`,
 	orderBy:         ` ORDER BY "created_at" DESC, "id" DESC`,

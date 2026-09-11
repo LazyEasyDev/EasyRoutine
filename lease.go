@@ -30,8 +30,8 @@ const (
 	RoutinePanic      RoutineStatus = "panic"
 )
 
-// LeaseState is the ownership and task state submitted with a lease action.
-type LeaseState struct {
+// leaseState is the ownership and task state submitted with a lease action.
+type leaseState struct {
 	// Name is the exact external task identifier.
 	Name   string
 	Owner  string
@@ -45,7 +45,7 @@ type LeaseState struct {
 	Log string
 }
 
-// SupervisorLog is a durable lifecycle event recorded by a LeaseProvider.
+// SupervisorLog is a durable lifecycle event recorded by the SQL backend.
 type SupervisorLog struct {
 	ID     string
 	Name   string
@@ -58,8 +58,8 @@ type SupervisorLog struct {
 }
 
 // SupervisorStatus is the latest state stored for a uniquely supervised task.
-// Owner identifies the last process to hold the lease; ExpiresAt determines
-// whether that ownership is still current.
+// Owner identifies the last process to hold the lease. ExpiresAt and UpdatedAt
+// are database-generated timestamps for observation.
 type SupervisorStatus struct {
 	Name         string
 	Owner        string
@@ -92,19 +92,21 @@ func validateRoutineName(name string) error {
 	return nil
 }
 
-// LeaseProvider is the backend required to coordinate unique supervisors across
-// processes. Redis is one possible implementation.
+// leaseProvider is the internal backend used to coordinate unique supervisors.
 //
 // Implementations must make the ownership effect of each Action atomic.
 // LeaseRenew may succeed only while Owner matches the value stored for Name.
+// Implementations should perform bounded, context-aware retries for transient
+// LeaseRenew backend errors before returning false. A false result means
+// ownership could not be confirmed and local work must stop.
 // LeaseRelease must end only a matching lease and is idempotent: it succeeds
 // when Owner no longer holds Name, including when no matching lease exists.
 // Methods must return promptly after ctx is canceled.
 // Action's result describes only the ownership change; log persistence must not
 // change a successful result to false. Query methods with no names return all
 // records. GetLogs returns records newest first.
-type LeaseProvider interface {
-	Action(ctx context.Context, action LeaseAction, state LeaseState) bool
+type leaseProvider interface {
+	Action(ctx context.Context, action LeaseAction, state leaseState) bool
 	GetStatuses(ctx context.Context, names ...string) ([]SupervisorStatus, error)
 	GetLogs(ctx context.Context, names ...string) ([]SupervisorLog, error)
 }

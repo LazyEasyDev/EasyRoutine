@@ -3,24 +3,9 @@ package EasyRoutine_test
 import (
 	"context"
 	"fmt"
-	"time"
 
 	EasyRoutine "github.com/LazyEasyDev/EasyRoutine"
 )
-
-type exampleLease struct{}
-
-func (exampleLease) Action(context.Context, EasyRoutine.LeaseAction, EasyRoutine.LeaseState) bool {
-	return true
-}
-
-func (exampleLease) GetLogs(context.Context, ...string) ([]EasyRoutine.SupervisorLog, error) {
-	return nil, nil
-}
-
-func (exampleLease) GetStatuses(context.Context, ...string) ([]EasyRoutine.SupervisorStatus, error) {
-	return nil, nil
-}
 
 func ExampleSafeGo() {
 	attempts := 0
@@ -41,20 +26,4 @@ func ExampleSafeGo() {
 	// Output:
 	// recovered temporary failure (failure 1)
 	// working
-}
-
-func ExampleStartUniqueSupervisor() {
-	if err := EasyRoutine.InitLease(exampleLease{}); err != nil {
-		panic(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	supervisor, err := EasyRoutine.StartUniqueSupervisor(ctx, "reports", func(ctx context.Context) {
-		fmt.Println("unique work")
-		cancel()
-	}, func(EasyRoutine.Panic) {}, time.Minute)
-	if err != nil {
-		panic(err)
-	}
-	supervisor.Wait()
-	// Output: unique work
 }

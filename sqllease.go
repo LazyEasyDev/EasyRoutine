@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const sqlRenewRetryDelay = 10 * time.Second
+
 // SQLDialect identifies a database compatibility target.
 type SQLDialect string
 
@@ -25,14 +27,14 @@ const (
 	SQLOracle     SQLDialect = "oracle"
 )
 
-// SQLLease coordinates unique supervisors and stores current state and
+// sqlLease coordinates unique supervisors and stores current state and
 // lifecycle history in SQL.
-// The application must open db with a database-specific driver.
-type SQLLease struct {
-	db         sqlLeaseExecer
-	statements sqlLeaseStatements
-	logs       sqlLogStatements
-	query      sqlQueryContext
+type sqlLease struct {
+	db              sqlLeaseExecer
+	statements      sqlLeaseStatements
+	logs            sqlLogStatements
+	query           sqlQueryContext
+	renewRetryDelay time.Duration
 }
 
 type sqlLeaseExecer interface {
@@ -52,38 +54,27 @@ type sqlLeaseStatements struct {
 	bindVariable    func(int) string
 }
 
-// NewSQLLease constructs a SQL lease provider for dialect. It does not create
-// tables. Call EnsureSchema before InitLease unless migrations already created
-// them.
-func NewSQLLease(db *sql.DB, dialect SQLDialect) (*SQLLease, error) {
-	if db == nil {
-		return nil, errors.New("SQL database is required")
-	}
-	return newSQLLease(db, dialect)
-}
-
 // InitSQLLease creates the current-state and lifecycle-history tables when
 // needed and registers the resulting provider for StartUniqueSupervisor.
 func InitSQLLease(ctx context.Context, db *sql.DB, dialect SQLDialect) error {
 	if ctx == nil {
 		return errors.New("context is required")
 	}
+	if db == nil {
+		return errors.New("SQL database is required")
+	}
 
-	backend, err := NewSQLLease(db, dialect)
+	backend, err := newSQLLease(db, dialect)
 	if err != nil {
 		return err
 	}
-	return initSQLLease(ctx, backend)
-}
-
-func initSQLLease(ctx context.Context, backend *SQLLease) error {
-	if err := backend.EnsureSchema(ctx); err != nil {
+	if err := backend.ensureSchema(ctx); err != nil {
 		return err
 	}
-	return InitLease(backend)
+	return initLease(backend)
 }
 
-func newSQLLease(db sqlLeaseExecer, dialect SQLDialect) (*SQLLease, error) {
+func newSQLLease(db sqlLeaseExecer, dialect SQLDialect) (*sqlLease, error) {
 	statements, err := statementsForSQLDialect(dialect)
 	if err != nil {
 		return nil, err
@@ -92,7 +83,12 @@ func newSQLLease(db sqlLeaseExecer, dialect SQLDialect) (*SQLLease, error) {
 	if err != nil {
 		return nil, err
 	}
-	backend := &SQLLease{db: db, statements: statements, logs: logs}
+	backend := &sqlLease{
+		db:              db,
+		statements:      statements,
+		logs:            logs,
+		renewRetryDelay: sqlRenewRetryDelay,
+	}
 	if queryer, ok := db.(interface {
 		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	}); ok {
@@ -101,8 +97,7 @@ func newSQLLease(db sqlLeaseExecer, dialect SQLDialect) (*SQLLease, error) {
 	return backend, nil
 }
 
-// EnsureSchema creates the current-state and lifecycle-history schema if needed.
-func (s *SQLLease) EnsureSchema(ctx context.Context) error {
+func (s *sqlLease) ensureSchema(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("context is required")
 	}
@@ -126,16 +121,7 @@ func (s *SQLLease) EnsureSchema(ctx context.Context) error {
 	return nil
 }
 
-func (s *SQLLease) acquire(ctx context.Context, name, owner string, ttl time.Duration) bool {
-	return s.acquireState(ctx, LeaseState{Name: name, Owner: owner, TTL: ttl, Status: RoutineNotStarted})
-}
-
-func (s *SQLLease) acquireState(ctx context.Context, state LeaseState) bool {
-	ttlArgument, ok := s.validLeaseArguments(ctx, state.Name, state.Owner, state.TTL)
-	if !ok {
-		return false
-	}
-
+func (s *sqlLease) acquireState(ctx context.Context, state leaseState, ttlArgument int64) bool {
 	id := routineID(state.Name)
 	result, err := s.db.ExecContext(ctx, s.statements.acquireExisting,
 		state.Name, state.Owner, ttlArgument, string(state.Status), state.SuccessCount, state.FailureCount, state.Log, id)
@@ -151,40 +137,33 @@ func (s *SQLLease) acquireState(ctx context.Context, state LeaseState) bool {
 	return err == nil && rowsAffected(result)
 }
 
-func (s *SQLLease) renew(ctx context.Context, name, owner string, ttl time.Duration) bool {
-	return s.renewState(ctx, LeaseState{Name: name, Owner: owner, TTL: ttl, Status: RoutineRunning})
-}
-
-func (s *SQLLease) renewState(ctx context.Context, state LeaseState) bool {
-	ttlArgument, ok := s.validLeaseArguments(ctx, state.Name, state.Owner, state.TTL)
-	if !ok {
+func (s *sqlLease) renewState(ctx context.Context, state leaseState, ttlArgument int64) bool {
+	args := []any{
+		ttlArgument,
+		string(state.Status),
+		state.SuccessCount,
+		state.FailureCount,
+		state.Log,
+		routineID(state.Name),
+		state.Owner,
+	}
+	result, err := s.db.ExecContext(ctx, s.statements.renew,
+		args...)
+	if err == nil {
+		return rowsAffected(result)
+	}
+	if ctx.Err() != nil || !waitForDelay(ctx, s.renewRetryDelay) {
 		return false
 	}
 
-	result, err := s.db.ExecContext(ctx, s.statements.renew,
-		ttlArgument, string(state.Status), state.SuccessCount, state.FailureCount, state.Log, routineID(state.Name), state.Owner)
+	result, err = s.db.ExecContext(ctx, s.statements.renew, args...)
 	return err == nil && rowsAffected(result)
 }
 
-func (s *SQLLease) release(ctx context.Context, name, owner string) bool {
-	return s.releaseState(ctx, LeaseState{Name: name, Owner: owner, Status: RoutineDone})
-}
-
-func (s *SQLLease) releaseState(ctx context.Context, state LeaseState) bool {
-	if ctx == nil || ctx.Err() != nil || s == nil || s.db == nil || state.Owner == "" || validateRoutineName(state.Name) != nil {
-		return false
-	}
-
+func (s *sqlLease) releaseState(ctx context.Context, state leaseState) bool {
 	_, err := s.db.ExecContext(ctx, s.statements.release,
 		string(state.Status), state.SuccessCount, state.FailureCount, state.Log, routineID(state.Name), state.Owner)
 	return err == nil
-}
-
-func (s *SQLLease) validLeaseArguments(ctx context.Context, name, owner string, ttl time.Duration) (int64, bool) {
-	if ctx == nil || ctx.Err() != nil || s == nil || s.db == nil || s.statements.ttlArgument == nil || owner == "" || validateRoutineName(name) != nil {
-		return 0, false
-	}
-	return s.statements.ttlArgument(ttl)
 }
 
 func rowsAffected(result sql.Result) bool {

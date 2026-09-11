@@ -1,82 +1,82 @@
 # EasyRoutine
 
-EasyRoutine runs local work with panic recovery and coordinates one active task
-across multiple processes.
+EasyRoutine manages background Go functions. Use `SafeGo` for local panic
+recovery. Use `StartUniqueSupervisor` when many processes may start the same
+task but only the process holding its SQL lease should run it.
 
-| API | Use it for |
+| API | Purpose |
 | --- | --- |
-| `SafeGo` | Local background work with policy-controlled panic retries |
-| `StartUniqueSupervisor` | A persistent task that must have one active owner across processes |
+| `SafeGo` | Run local work with policy-controlled panic retries |
+| `InitSQLLease` | Initialize SQL coordination and create missing schema objects |
+| `StartUniqueSupervisor` | Run persistent work while this process owns its lease |
+| `GetStatuses` | Read current supervisor state from SQL |
+| `GetLogs` | Read retained acquire and release history from SQL |
+| `Handle` | Stop, wait for, or observe managed work |
 
-## Part 1: Usage
+## Install
 
-### Install
+The module currently targets Go 1.25.13.
 
 ```sh
 go get github.com/LazyEasyDev/EasyRoutine
 ```
 
-The examples use this import:
-
 ```go
 import EasyRoutine "github.com/LazyEasyDev/EasyRoutine"
 ```
 
-All task contexts and callbacks are required. Invalid startup arguments return
-an error before a goroutine is started. Tasks should observe `ctx.Done()` and
-pass the supplied context to network and database calls so cancellation can
-finish. In the snippets below, `appCtx` is the application's context.
+## Local Work
 
-### Run Local Work with SafeGo
-
-`SafeGo` starts a goroutine and recovers task panics. Its policy receives the
-recovered value, stack trace, and a one-based failure count.
+`SafeGo` starts a goroutine and recovers task panics. The panic policy receives
+the recovered value, stack trace, and one-based failure count.
 
 ```go
-handle, err := EasyRoutine.SafeGo(appCtx, func(ctx context.Context) {
-	process(ctx)
-}, func(recovered EasyRoutine.Panic, failures int) EasyRoutine.PanicDecision {
-	log.Printf("attempt %d panicked: %v\n%s", failures, recovered.Value, recovered.Stack)
-
-	if failures >= 3 {
-		return EasyRoutine.NoRetry()
-	}
-	return EasyRoutine.PanicDecision{
-		Retry: true,
-		After: 30 * time.Second,
-	}
-})
+handle, err := EasyRoutine.SafeGo(
+	appCtx,
+	func(ctx context.Context) {
+		process(ctx)
+	},
+	func(recovered EasyRoutine.Panic, failures int) EasyRoutine.PanicDecision {
+		log.Printf("attempt %d panicked: %v\n%s", failures, recovered.Value, recovered.Stack)
+		if failures >= 3 {
+			return EasyRoutine.NoRetry()
+		}
+		return EasyRoutine.PanicDecision{
+			Retry: true,
+			After: 30 * time.Second,
+		}
+	},
+)
 if err != nil {
 	log.Fatal(err)
 }
+defer handle.Stop()
 ```
 
-Return values from the policy:
-
-| Decision | Result |
+| Panic decision | Result |
 | --- | --- |
-| `PanicDecision{Retry: true, After: delay}` | Run the task again after `delay` |
+| `PanicDecision{Retry: true, After: delay}` | Retry after `delay` |
 | `PanicDecision{Retry: true}` | Retry immediately |
-| `NoRetry()` or `PanicDecision{}` | Stop after recovering the panic |
+| `NoRetry()` or `PanicDecision{}` | Stop after recovery |
 
-A panic from the policy safely stops the task. The context, task, and policy are
-required; invalid startup arguments are returned as errors before a goroutine is
-started. `NoRetry()` returns a new stop decision. `SafeGo` also stops when the
-task returns normally, the parent context is canceled, or `Stop()` is called.
+The context, task, and panic policy must be non-nil, and the context must still
+be active. Invalid arguments return an error before a goroutine starts. A panic
+from the policy is contained and stops the task.
 
 Each retry receives a fresh child context. The failed attempt's context is
-canceled before the policy runs.
+canceled before the policy runs. A normal return or a stop decision finishes
+`SafeGo`. Parent cancellation and `Handle.Stop` stop further retries, but the
+handle cannot complete until the current task returns.
 
-### Run One Task Across Many Processes
+## Unique Work Across Processes
 
-A unique supervisor needs one lease backend configured during process startup.
-The included SQL backend is the usual setup.
+Unique supervisors use the built-in SQL lease backend. Initialize it once in
+each application process before starting supervisors or querying SQL state.
 
-#### Configure a SQL Backend
+### Initialize SQL
 
-The application owns and imports its `database/sql` driver. EasyRoutine adds no
-ORM or wire-driver dependency. This PostgreSQL example uses
-`github.com/jackc/pgx/v5/stdlib`:
+The application opens and imports its own `database/sql` driver. EasyRoutine
+does not include a database driver. This example uses PostgreSQL with pgx:
 
 ```go
 import (
@@ -89,25 +89,25 @@ db, err := sql.Open("pgx", databaseURL)
 if err != nil {
 	log.Fatal(err)
 }
+defer db.Close()
 
 if err := EasyRoutine.InitSQLLease(appCtx, db, EasyRoutine.SQLPostgreSQL); err != nil {
 	log.Fatal(err)
 }
 ```
 
-`InitSQLLease` creates the `unique_routine` current-state table and the
-`unique_routine_log` history table when needed, adds the history routine-ID
-index, and registers the backend. It is safe for each application process to
-call during startup, but the database user must have permission to create them.
+`InitSQLLease` validates its inputs, creates missing schema objects, and then
+registers the SQL backend. If schema setup fails, it returns an error without
+registering the backend. Call it exactly once per process. Multiple processes
+may initialize against the same shared database during startup.
 
-`EnsureSchema` creates missing objects; it does not alter existing columns.
-Installations created with an older schema must migrate or recreate
-`unique_routine` and `unique_routine_log` before upgrading because it does not
-add the new `routine_id` columns or replace older indexes automatically.
+The database user must be allowed to execute the schema statements. Startup
+creates missing objects but does not migrate or validate existing columns.
+Upgrade an older schema separately before starting the application.
 
-Select the database family explicitly:
+Supported dialects:
 
-| Database | Dialect constant |
+| Database | Dialect |
 | --- | --- |
 | PostgreSQL | `SQLPostgreSQL` |
 | MySQL | `SQLMySQL` |
@@ -118,29 +118,16 @@ Select the database family explicitly:
 | GaussDB | `SQLGaussDB` |
 | Oracle | `SQLOracle` |
 
-SQLite is appropriate only when every process can safely access the same
-database file. Use a server database for coordination across hosts.
+SQLite coordinates only processes that can safely access the same database
+file. Use a server database when processes run on different hosts.
 
-#### Start the Supervisor
+### Start a Supervisor
 
-Every process may start a supervisor with the same name. Only the lease owner
-runs the task. Use the same stable name in every process.
-
-A task name must:
-
-- contain 1 to 255 bytes of valid UTF-8;
-- have no leading or trailing whitespace; and
-- contain no control characters anywhere.
-
-**Important:** Control characters are forbidden even when they appear in the
-middle of a name. This includes newlines (`\n`), carriage returns (`\r`), tabs
-(`\t`), null bytes (`\x00`), escape characters (`\x1b`), and delete (`\x7f`).
-For example, `daily report` is valid, but `daily\nreport`, `daily\treport`, and
-`daily\x00report` are invalid. Ordinary internal spaces, Unicode text,
-punctuation, quotes, and symbols are allowed.
+Every process may start a supervisor with the same stable name. Under normal
+lease operation, only the current owner runs the task.
 
 ```go
-supervisor, err := EasyRoutine.StartUniqueSupervisor(
+handle, err := EasyRoutine.StartUniqueSupervisor(
 	appCtx,
 	"queue-consumer",
 	func(ctx context.Context) {
@@ -154,213 +141,168 @@ supervisor, err := EasyRoutine.StartUniqueSupervisor(
 if err != nil {
 	log.Fatal(err)
 }
+defer handle.Stop()
 ```
 
-After the task function returns normally, the supervisor retains the lease and
-starts it again after the repeat delay. A zero duration repeats immediately; a
-negative duration is rejected. Lease heartbeats continue during the wait.
+The context, task, and panic handler are required. The repeat delay must not be
+negative; zero repeats immediately. Invalid arguments return an error before a
+goroutine starts. `InitSQLLease` must succeed before this call.
 
-The panic callback is required and notification-only. Supervisor recovery
-timing is fixed and cannot be changed by the callback.
+A supervisor name must:
 
-#### Read Current Status and History
+- contain 1 to 255 bytes of valid UTF-8;
+- have no leading or trailing whitespace; and
+- contain no control characters.
 
-Read the single current status row for every task or selected tasks:
+Names are exact identifiers. Case and UTF-8 byte representation are preserved,
+so every process must use the same name for the same task.
 
-```go
-allStatuses, err := EasyRoutine.GetStatuses(appCtx)
-selectedStatuses, err := EasyRoutine.GetStatuses(appCtx, "queue-consumer", "billing")
-```
+After a normal return, the supervisor retains its lease and starts the task
+again after the repeat delay. Heartbeats continue during this wait. The panic
+handler is notification-only and cannot change recovery timing. It runs after
+the first panic release attempt; a panic from the handler is contained.
 
-Statuses are ordered by name. `ExpiresAt` determines whether the stored owner
-still has a live lease; a clean release keeps the row and expires its lease
-immediately. The row can also describe the last observed state of a process
-whose lease expired.
-
-Read retained logs for every task, selected tasks, or an existing slice:
-
-```go
-allLogs, err := EasyRoutine.GetLogs(appCtx)
-selectedLogs, err := EasyRoutine.GetLogs(appCtx, "queue-consumer", "billing")
-sliceLogs, err := EasyRoutine.GetLogs(appCtx, names...)
-```
-
-Results are newest first. Each history record contains the action, task status,
-owner token, message, and a database-generated timestamp. Panic records include
-the recovered value and stack in `Log`; other records have an empty message.
-Current statuses contain `SuccessCount` and `FailureCount`. Those counters
-belong to one supervisor instance and reset when a new instance starts.
-
-Current state is persisted, and history events are sampled, by lease actions
-rather than on every task transition:
-
-| Action | Snapshot |
-| --- | --- |
-| `LeaseAcquire` | `RoutineNotStarted` before the first attempt for that owner |
-| `LeaseRenew` | Latest `RoutineRunning` or `RoutineDone` state and counters |
-| `LeaseRelease` | Final `RoutineDone` or `RoutinePanic` state and counters |
-
-The SQL backend retains the newest 25 history records for each task name. Log
-insertion and pruning are best effort and never change a successful lease
-operation into a failure. Release is idempotent, so its history snapshot is
-also recorded when that owner no longer has a matching live lease.
-
-#### Use a Custom Backend
-
-Register a custom `LeaseProvider` instead of the SQL backend:
-
-```go
-if err := EasyRoutine.InitLease(myLeaseProvider); err != nil {
-	log.Fatal(err)
-}
-```
-
-Call `InitLease` or `InitSQLLease` exactly once per process and before starting
-any unique supervisor. `SafeGo` does not require lease initialization.
-
-#### Manage SQL Schema Separately
-
-When migrations or a privileged startup step owns DDL, construct the backend
-without automatically creating the tables:
-
-```go
-backend, err := EasyRoutine.NewSQLLease(db, EasyRoutine.SQLPostgreSQL)
-if err != nil {
-	log.Fatal(err)
-}
-
-if err := EasyRoutine.InitLease(backend); err != nil {
-	log.Fatal(err)
-}
-```
-
-Run `backend.EnsureSchema(ctx)` from the schema-management step when desired.
-
-### Stop and Observe Work
-
-Both `Handle` and `UniqueSupervisor` expose the same lifecycle methods:
-
-```go
-worker.Stop()      // request cooperative cancellation
-<-worker.Done()   // wait using a channel
-worker.Wait()     // or block directly
-```
-
-`Done()` only returns a completion channel; calling it does not stop work.
-Stopping is cooperative, so completion waits for the task to return.
-
-For a unique supervisor, the heartbeat continues while the canceled task
-performs cleanup. After cleanup, the supervisor stops renewal and makes one
-bounded release attempt. If that release fails, shutdown still completes and
-the lease remains unavailable until its database expiration time.
-
----
-
-## Part 2: Design and Internals
-
-### Local Panic Recovery
-
-`SafeGo` executes one task attempt at a time:
-
-1. Create a child context for the attempt.
-2. Run the task and recover any panic with its stack trace.
-3. Cancel the failed attempt's context.
-4. Call `PanicPolicy` with the one-based failure count.
-5. Stop or wait for the requested delay and retry with a fresh context.
-
-EasyRoutine cannot track or wait for goroutines created inside a task. Those
-goroutines must observe the task context themselves.
-
-### Unique Supervisor State Flow
+### Lifecycle
 
 ```mermaid
 flowchart TD
-    A[Try to acquire lease] -->|not acquired| B[Wait one heartbeat]
+    A[Try to acquire] -->|busy or error| B[Wait 30 seconds]
     B --> A
     A -->|acquired| C[Run task and renew lease]
-	C -->|normal return| D[Keep lease and wait RepeatAfter]
+    C -->|normal return| D[Wait RepeatAfter while retaining lease]
     D --> C
-    C -->|lease lost| E[Cancel task and wait for cleanup]
-    E --> B
-    C -->|task panic| F[Stop renewal and attempt release]
-    F --> G[Wait 300 seconds]
-    G --> A
-    C -->|stop or parent cancellation| H[Wait for cleanup, release, finish]
+    C -->|renewal not confirmed| E[Cancel task and wait for cleanup]
+    E --> F[Attempt release once]
+    F --> B
+    C -->|task panic| G[Stop renewal and attempt release]
+    G --> H[Notify panic handler]
+    H --> I[Wait through 300-second cooldown]
+    I --> A
+    C -->|Stop or parent cancellation| J[Cancel task and wait for cleanup]
+    J --> K[Stop renewal, attempt release, finish]
 ```
 
-On panic, the first release attempt happens before `SupervisorPanicHandler` is
-called. Failed releases are attempted again on the heartbeat cadence during the
-300-second cooldown. If release succeeds, this process remains idle for the
-rest of the cooldown while another process may acquire the lease immediately.
+When renewal returns `false`, the supervisor can no longer confirm ownership.
+It cancels the task, waits for the task to return, makes one owner-guarded
+release attempt, waits one heartbeat, and then competes again with a new owner
+token.
 
-### Fixed Timing
+On panic, renewal stops before the first release attempt. If release fails, the
+supervisor retries it on the heartbeat cadence during the cooldown. This
+process does not compete for the lease again until the full cooldown ends.
+
+On `Stop` or parent cancellation, the heartbeat remains active while the task
+performs cooperative cleanup. After the task returns, the supervisor stops the
+heartbeat and makes one bounded release attempt. The handle completes even if
+that release fails. If the task never returns, cleanup cannot finish and the
+heartbeat continues while SQL renewal succeeds.
+
+Fixed timings:
 
 | Setting | Value | Purpose |
 | --- | ---: | --- |
-| Lease TTL | 180 seconds | Maximum ownership lifetime without a successful renewal |
-| Heartbeat | 30 seconds | Acquisition, renewal, and failed-release cadence |
-| Release timeout | 30 seconds | Maximum duration of one release call |
-| Panic cooldown | 300 seconds | Delay before the panicked process competes for ownership again |
+| Lease TTL | 180 seconds | Ownership lifetime without renewal |
+| Heartbeat | 30 seconds | Acquisition, renewal, and panic-release retry cadence |
+| Release timeout | 30 seconds | Maximum duration of one release attempt |
+| Panic cooldown | 300 seconds | Delay before the panicked process competes again |
 
-Lease expiration is calculated with the database clock, avoiding dependence on
-application-host clock agreement.
+SQL renewal retries once after a 10-second, context-aware delay when execution
+returns an error. A successful statement affecting zero rows is not retried;
+it means ownership was not confirmed.
 
-### Lease Backend Contract
+## Handles and Cancellation
+
+Both launch functions return `*Handle`.
 
 ```go
-type LeaseProvider interface {
-	Action(ctx context.Context, action LeaseAction, state LeaseState) bool
-	GetStatuses(ctx context.Context, names ...string) ([]SupervisorStatus, error)
-	GetLogs(ctx context.Context, names ...string) ([]SupervisorLog, error)
-}
+handle.Stop()     // request cooperative cancellation
+<-handle.Done()  // wait with a channel
+handle.Wait()    // or wait directly
 ```
 
-Backend requirements:
+`Done` only returns a completion channel; it does not stop work. `Wait` and
+`Done` complete after managed work and cleanup finish. Calling `Stop` more than
+once is safe. Tasks must observe `ctx.Done()` and pass their supplied context to
+blocking operations because EasyRoutine cannot force a function to return.
 
-- The ownership effect of each `Action` must be atomic.
-- `LeaseRenew` may succeed only while the lease belongs to `state.Owner`.
-- `LeaseRelease` must end only a lease owned by `state.Owner`. It is idempotent
-  and returns `true` when that owner no longer holds the lease, including when
-  no matching lease exists.
-- `LeaseAcquire` may only claim an absent or expired lease.
-- Methods must return promptly when their context is canceled.
-- `LeaseAcquire` and `LeaseRenew` return `true` only when their requested
-	ownership changes succeed.
-- `GetStatuses(ctx)` returns one current row per task ordered by name; supplied
-  names filter the result.
-- `GetLogs(ctx)` returns all retained records newest first; supplied names
-	filter the result.
+Task functions, panic policies, and panic handlers must not call
+`runtime.Goexit`. `Goexit` is not a panic and bypasses normal recovery and
+lifecycle control. Return from the callback instead.
 
-`LeaseState` carries the task name, owner, TTL, current status, cumulative
-counts, and optional log message. Supported statuses are `RoutineNotStarted`,
-`RoutineRunning`, `RoutineDone`, and `RoutinePanic`.
+## Status and History
 
-Each ownership attempt uses a new cryptographically random owner token. Backend
-panics are contained and treated as failed operations.
+`GetStatuses` and `GetLogs` require successful SQL initialization. With no
+names they return all records. Supplied names use the supervisor-name validation
+rules. Duplicate filters are removed and large filters are queried in bounded
+batches.
 
-### SQL Backend
+```go
+statuses, err := EasyRoutine.GetStatuses(appCtx)
+if err != nil {
+	log.Fatal(err)
+}
+log.Printf("statuses: %+v", statuses)
 
-The built-in backend hashes the exact UTF-8 task name with SHA-256 and stores
-the lowercase hexadecimal result as an internal `routine_id`. This fixed-size
-identifier is the current-state primary key and the history lookup index, so
-database collation does not control task identity. The original name remains
-stored and returned by query APIs. Names that differ by case or Unicode byte
-representation are distinct.
+logs, err := EasyRoutine.GetLogs(appCtx, "queue-consumer", "billing")
+if err != nil {
+	log.Fatal(err)
+}
+log.Printf("logs: %+v", logs)
+```
 
-The backend stores ownership and the latest state together in one
-`unique_routine` row per routine ID. It stores recent lifecycle history in
-`unique_routine_log`, indexed by routine ID. Database-specific statements
-update ownership and current state atomically using the database clock. After
-every successful action, the backend inserts a best-effort history snapshot
-and removes records older than the newest 25 for that routine ID.
+Statuses are ordered by name. A `SupervisorStatus` is a read-only snapshot of
+the `unique_routine` row; it does not control the supervisor lifecycle.
+`ExpiresAt` and `UpdatedAt` are generated from the database clock. The row is
+retained after release or expiration, so it may describe a previous owner.
 
-ClickHouse is intentionally unsupported. Its normal mutation model does not
-provide the transactional, uniqueness-enforcing row operations required by
-this lease protocol.
+`SuccessCount` and `FailureCount` belong to one in-process supervisor started by
+`StartUniqueSupervisor`. They persist if that same supervisor reacquires a
+lease and reset when a new supervisor is started.
 
-### Distributed Safety
+Current state is sampled during lease operations:
 
-A time-based lease prevents concurrent owners during normal operation, but it
-cannot guarantee that stale work has stopped after a long process pause or
-network partition. Use idempotent operations or backend-specific fencing tokens
-for side effects that require strict ordering.
+| Operation | Current-state snapshot | History row |
+| --- | --- | --- |
+| Acquire | `RoutineNotStarted` for the new owner | Yes |
+| Renew | Latest sampled status, counters, and log | No |
+| Release | Final `RoutineDone` or `RoutinePanic` state | Yes |
+
+`GetLogs` returns history newest first. The SQL backend retains the newest 25
+records per routine ID. Panic release records include the recovered value and
+stack in `Log`; normal records have an empty message. History insertion and
+pruning are best effort. SQL errors from either operation do not change a
+successful lease result.
+
+Release is owner-guarded and idempotent. If its owner no longer matches the
+current row, the update is a successful no-op. It cannot alter that row, but it
+still produces its own history record.
+
+## SQL Model
+
+The backend uses two tables:
+
+- `unique_routine` stores current ownership and the latest sampled state.
+- `unique_routine_log` stores best-effort bounded acquire and release history.
+
+The exact UTF-8 supervisor name is hashed with SHA-256. Its lowercase
+hexadecimal digest is stored as `routine_id`, which is the current-state primary
+key and history lookup key. The original name is also stored and returned.
+Using a fixed binary-derived identifier prevents database collation from
+changing name identity.
+
+Acquisition claims only a missing or database-expired row. Renewal requires the
+same owner and a lease that is still active according to the database clock.
+Release expires only a row with the same owner and never deletes it. Lease
+decisions and persisted timestamps use database time, while local timers only
+schedule heartbeats, delays, and timeouts.
+
+ClickHouse is intentionally unsupported because its normal mutation model does
+not provide the uniqueness-enforcing row operations required by this lease
+protocol.
+
+## Distributed Safety
+
+A time-based lease coordinates one owner during normal operation, but it cannot
+prove that stale work stopped after a long process pause or network partition.
+Use idempotent side effects or a fencing mechanism when strict ordering is
+required.

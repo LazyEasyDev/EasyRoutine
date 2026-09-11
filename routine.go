@@ -30,7 +30,7 @@ func NoRetry() PanicDecision {
 // count. A policy panic stops the task after recovery.
 type PanicPolicy func(recovered Panic, failures int) PanicDecision
 
-// Handle controls and observes a running task.
+// Handle controls and observes managed background work.
 type Handle struct {
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -39,6 +39,7 @@ type Handle struct {
 // SafeGo launches a panic-safe goroutine derived from ctx. Its policy decides
 // whether and when a panicked task is retried. The context, task, and policy
 // are required. Invalid arguments are returned before a goroutine is started.
+// The task and policy must not call runtime.Goexit.
 func SafeGo(ctx context.Context, task func(ctx context.Context), policy PanicPolicy) (*Handle, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
@@ -74,17 +75,17 @@ func startHandle(parent context.Context, run func(context.Context)) *Handle {
 	return handle
 }
 
-// Stop requests cooperative cancellation of the task.
+// Stop requests cooperative cancellation of the managed work.
 func (h *Handle) Stop() {
 	h.cancel()
 }
 
-// Done is closed after the task and its panic policy return.
+// Done is closed after the managed work and its cleanup finish.
 func (h *Handle) Done() <-chan struct{} {
 	return h.done
 }
 
-// Wait blocks until the task and its panic policy return.
+// Wait blocks until the managed work and its cleanup finish.
 func (h *Handle) Wait() {
 	<-h.done
 }

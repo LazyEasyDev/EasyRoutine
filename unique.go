@@ -28,7 +28,7 @@ type leaseTiming struct {
 }
 
 type coordinator struct {
-	backend LeaseProvider
+	backend leaseProvider
 	timing  leaseTiming
 }
 
@@ -49,10 +49,10 @@ func newSupervisorState() *supervisorState {
 	return &supervisorState{status: RoutineNotStarted}
 }
 
-func (s *supervisorState) snapshot(name, owner string, ttl time.Duration) LeaseState {
+func (s *supervisorState) snapshot(name, owner string, ttl time.Duration) leaseState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return LeaseState{
+	return leaseState{
 		Name:         name,
 		Owner:        owner,
 		TTL:          ttl,
@@ -104,17 +104,11 @@ type uniqueTask struct {
 	RepeatAfter time.Duration
 }
 
-// UniqueSupervisor controls and observes a persistent distributed task supervisor.
-type UniqueSupervisor struct {
-	handle *Handle
-}
-
 // SupervisorPanicHandler observes a panic from a uniquely supervised task.
 // Recovery policy is fixed; the handler does not control when work resumes.
 type SupervisorPanicHandler func(Panic)
 
-// InitLease sets the backend used by StartUniqueSupervisor. It may be called only once.
-func InitLease(backend LeaseProvider) error {
+func initLease(backend leaseProvider) error {
 	if backend == nil {
 		return errors.New("lease provider is required")
 	}
@@ -140,8 +134,9 @@ func InitLease(backend LeaseProvider) error {
 // Supervision continues until ctx is canceled or Stop is called.
 // The context, task, and panic handler are required. A negative repeat delay
 // is invalid. Invalid arguments are returned before a goroutine is started.
-// InitLease must be called before StartUniqueSupervisor.
-func StartUniqueSupervisor(ctx context.Context, name string, run func(context.Context), onPanic SupervisorPanicHandler, repeatAfter time.Duration) (*UniqueSupervisor, error) {
+// The task and panic handler must not call runtime.Goexit.
+// InitSQLLease must be called before StartUniqueSupervisor.
+func StartUniqueSupervisor(ctx context.Context, name string, run func(context.Context), onPanic SupervisorPanicHandler, repeatAfter time.Duration) (*Handle, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
@@ -170,21 +165,11 @@ func StartUniqueSupervisor(ctx context.Context, name string, run func(context.Co
 	return configured.startUniqueSupervisor(ctx, name, uniqueTask{Run: run, RepeatAfter: repeatAfter}, onPanic)
 }
 
-func (c *coordinator) startUniqueSupervisor(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) (*UniqueSupervisor, error) {
-	if err := validateRoutineName(name); err != nil {
-		return nil, err
-	}
-	if task.Run == nil {
-		return nil, errors.New("task is required")
-	}
-	if task.RepeatAfter < 0 {
-		return nil, errors.New("task repeat delay must not be negative")
-	}
-
+func (c *coordinator) startUniqueSupervisor(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) (*Handle, error) {
 	handle := startHandle(ctx, func(ctx context.Context) {
 		c.run(ctx, name, task, onPanic)
 	})
-	return &UniqueSupervisor{handle: handle}, nil
+	return handle, nil
 }
 
 func (c *coordinator) run(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) {
@@ -356,7 +341,7 @@ func waitForNextCycleAsOwner(ctx context.Context, heartbeatDone <-chan struct{},
 	}
 }
 
-func (c *coordinator) action(ctx context.Context, action LeaseAction, state LeaseState) (applied bool) {
+func (c *coordinator) action(ctx context.Context, action LeaseAction, state leaseState) (applied bool) {
 	defer func() {
 		if recover() != nil {
 			applied = false
@@ -373,19 +358,4 @@ func (c *coordinator) releaseWithin(name, owner string, state *supervisorState, 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return c.action(ctx, LeaseRelease, state.snapshot(name, owner, c.timing.ttl))
-}
-
-// Stop requests cooperative cancellation of the supervised task.
-func (s *UniqueSupervisor) Stop() {
-	s.handle.Stop()
-}
-
-// Done is closed after supervision and task cleanup finish.
-func (s *UniqueSupervisor) Done() <-chan struct{} {
-	return s.handle.Done()
-}
-
-// Wait blocks until supervision and task cleanup finish.
-func (s *UniqueSupervisor) Wait() {
-	s.handle.Wait()
 }

@@ -57,7 +57,7 @@ type retryReleaseLease struct {
 
 type recordedLeaseAction struct {
 	action LeaseAction
-	state  LeaseState
+	state  leaseState
 }
 
 type recordingLease struct {
@@ -97,7 +97,7 @@ func (l *logQueryLease) GetStatuses(_ context.Context, names ...string) ([]Super
 	return append([]SupervisorStatus(nil), l.statuses...), nil
 }
 
-func (r *recordingLease) Action(ctx context.Context, action LeaseAction, state LeaseState) bool {
+func (r *recordingLease) Action(ctx context.Context, action LeaseAction, state leaseState) bool {
 	applied := r.memoryLease.Action(ctx, action, state)
 	if !applied {
 		return false
@@ -117,7 +117,7 @@ func (r *recordingLease) recordedActions() []recordedLeaseAction {
 	return append([]recordedLeaseAction(nil), r.calls...)
 }
 
-func (c *countingLease) Action(ctx context.Context, action LeaseAction, state LeaseState) bool {
+func (c *countingLease) Action(ctx context.Context, action LeaseAction, state leaseState) bool {
 	switch action {
 	case LeaseAcquire:
 		c.acquires.Add(1)
@@ -137,7 +137,7 @@ func (c *countingLease) Action(ctx context.Context, action LeaseAction, state Le
 	return applied
 }
 
-func (c *coordinatedLossLease) Action(ctx context.Context, action LeaseAction, state LeaseState) bool {
+func (c *coordinatedLossLease) Action(ctx context.Context, action LeaseAction, state leaseState) bool {
 	if action == LeaseAcquire {
 		c.acquires.Add(1)
 	}
@@ -157,7 +157,7 @@ func (c *coordinatedLossLease) Action(ctx context.Context, action LeaseAction, s
 	return applied
 }
 
-func (b *blockingRenewLease) Action(ctx context.Context, action LeaseAction, state LeaseState) bool {
+func (b *blockingRenewLease) Action(ctx context.Context, action LeaseAction, state leaseState) bool {
 	if action != LeaseRenew {
 		return b.memoryLease.Action(ctx, action, state)
 	}
@@ -167,19 +167,19 @@ func (b *blockingRenewLease) Action(ctx context.Context, action LeaseAction, sta
 	return false
 }
 
-func (p *panicAcquireLease) Action(context.Context, LeaseAction, LeaseState) bool {
+func (p *panicAcquireLease) Action(context.Context, LeaseAction, leaseState) bool {
 	p.attempted <- struct{}{}
 	panic("action failed")
 }
 
-func (panicReleaseLease) Action(_ context.Context, action LeaseAction, _ LeaseState) bool {
+func (panicReleaseLease) Action(_ context.Context, action LeaseAction, _ leaseState) bool {
 	if action == LeaseRelease {
 		panic("release failed")
 	}
 	return true
 }
 
-func (r *retryReleaseLease) Action(ctx context.Context, action LeaseAction, state LeaseState) bool {
+func (r *retryReleaseLease) Action(ctx context.Context, action LeaseAction, state leaseState) bool {
 	if action == LeaseRelease {
 		if r.attempts.Add(1) < 3 {
 			return false
@@ -192,14 +192,14 @@ func (r *retryReleaseLease) Action(ctx context.Context, action LeaseAction, stat
 	return applied
 }
 
-func (p *panicRenewLease) Action(ctx context.Context, action LeaseAction, state LeaseState) bool {
+func (p *panicRenewLease) Action(ctx context.Context, action LeaseAction, state leaseState) bool {
 	if action == LeaseRenew {
 		panic("renew failed")
 	}
 	return p.memoryLease.Action(ctx, action, state)
 }
 
-func (m *memoryLease) Action(_ context.Context, action LeaseAction, state LeaseState) bool {
+func (m *memoryLease) Action(_ context.Context, action LeaseAction, state leaseState) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -255,10 +255,10 @@ func (panicReleaseLease) GetStatuses(context.Context, ...string) ([]SupervisorSt
 
 func TestUniqueSupervisorUsesInitializedBackend(t *testing.T) {
 	resetDefaultCoordinator(t)
-	if err := InitLease(&memoryLease{}); err != nil {
+	if err := initLease(&memoryLease{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := InitLease(&memoryLease{}); err == nil {
+	if err := initLease(&memoryLease{}); err == nil {
 		t.Fatal("expected repeated initialization error")
 	}
 	started := make(chan struct{})
@@ -888,7 +888,8 @@ func TestRenewPanicIsContained(t *testing.T) {
 }
 
 func TestInitLeaseRequiresBackend(t *testing.T) {
-	if err := InitLease(nil); err == nil {
+	resetDefaultCoordinator(t)
+	if err := initLease(nil); err == nil {
 		t.Fatal("expected missing backend error")
 	}
 }
@@ -925,7 +926,7 @@ func TestGetLogsUsesInitializedBackend(t *testing.T) {
 	resetDefaultCoordinator(t)
 	want := []SupervisorLog{{ID: "log-1", Name: "reports"}}
 	backend := &logQueryLease{logs: want}
-	if err := InitLease(backend); err != nil {
+	if err := initLease(backend); err != nil {
 		t.Fatal(err)
 	}
 
@@ -952,7 +953,7 @@ func TestGetStatusesUsesInitializedBackend(t *testing.T) {
 	resetDefaultCoordinator(t)
 	want := []SupervisorStatus{{Name: "reports", Status: RoutineRunning}}
 	backend := &logQueryLease{statuses: want}
-	if err := InitLease(backend); err != nil {
+	if err := initLease(backend); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1021,7 +1022,7 @@ func TestGetStatusesValidatesRequest(t *testing.T) {
 
 func TestGetLogsContainsProviderPanic(t *testing.T) {
 	resetDefaultCoordinator(t)
-	if err := InitLease(&panicLogLease{}); err != nil {
+	if err := initLease(&panicLogLease{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := GetLogs(context.Background()); err == nil || !strings.Contains(err.Error(), "panicked") {
@@ -1031,7 +1032,7 @@ func TestGetLogsContainsProviderPanic(t *testing.T) {
 
 func TestGetStatusesContainsProviderPanic(t *testing.T) {
 	resetDefaultCoordinator(t)
-	if err := InitLease(&panicLogLease{}); err != nil {
+	if err := initLease(&panicLogLease{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := GetStatuses(context.Background()); err == nil || !strings.Contains(err.Error(), "panicked") {
@@ -1041,7 +1042,7 @@ func TestGetStatusesContainsProviderPanic(t *testing.T) {
 
 func TestCoordinatorDefaults(t *testing.T) {
 	resetDefaultCoordinator(t)
-	if err := InitLease(&memoryLease{}); err != nil {
+	if err := initLease(&memoryLease{}); err != nil {
 		t.Fatal(err)
 	}
 	configured := defaultCoordinator
