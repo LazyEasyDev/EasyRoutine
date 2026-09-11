@@ -2,44 +2,60 @@ package EasyRoutine
 
 import (
 	"context"
+	"errors"
 	"runtime/debug"
 	"time"
 )
 
-// Task is work launched by Go or a UniqueSupervisor. It should observe ctx to support cancellation.
-type Task func(ctx context.Context)
-
-// Panic describes a panic recovered from a Task.
+// Panic describes a panic recovered from a task.
 type Panic struct {
 	Value any
 	Stack []byte
 }
 
-// PanicRetry controls when a panicked Task is retried.
-type PanicRetry uint8
+// PanicDecision controls whether and when SafeGo retries a panicked task.
+type PanicDecision struct {
+	// Retry starts the task again after recovery.
+	Retry bool
+	// After is the delay before retrying. A non-positive value retries immediately.
+	After time.Duration
+}
 
-const (
-	PanicRetry30s PanicRetry = iota + 1
-	PanicRetry90s
-	PanicRetry300s
-)
+// NoRetry returns a decision that stops SafeGo after recovering a panic.
+func NoRetry() PanicDecision {
+	return PanicDecision{}
+}
 
-// PanicHandler is called after a Task panics. A nil handler, a handler panic,
-// or an unsupported retry value defaults to PanicRetry90s.
-type PanicHandler func(Panic) PanicRetry
+// PanicPolicy receives a recovered panic and its one-based consecutive failure
+// count. A policy panic stops the task after recovery.
+type PanicPolicy func(recovered Panic, failures int) PanicDecision
 
-// Handle controls and observes a running Task.
+// Handle controls and observes a running task.
 type Handle struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
-// Go launches a local panic-safe goroutine derived from ctx. A panicked Task is
-// retried until it returns normally or ctx is canceled. The context must not be nil.
-func Go(ctx context.Context, task Task, onPanic PanicHandler) *Handle {
+// SafeGo launches a panic-safe goroutine derived from ctx. Its policy decides
+// whether and when a panicked task is retried. The context, task, and policy
+// are required. Invalid arguments are returned before a goroutine is started.
+func SafeGo(ctx context.Context, task func(ctx context.Context), policy PanicPolicy) (*Handle, error) {
+	if ctx == nil {
+		return nil, errors.New("context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if task == nil {
+		return nil, errors.New("task is required")
+	}
+	if policy == nil {
+		return nil, errors.New("panic policy is required")
+	}
+
 	return startHandle(ctx, func(ctx context.Context) {
-		runTask(ctx, task, onPanic)
-	})
+		runTask(ctx, task, policy)
+	}), nil
 }
 
 func startHandle(parent context.Context, run func(context.Context)) *Handle {
@@ -58,45 +74,46 @@ func startHandle(parent context.Context, run func(context.Context)) *Handle {
 	return handle
 }
 
-func launch(parent context.Context, task Task, onPanic PanicHandler) *Handle {
-	return startHandle(parent, func(ctx context.Context) {
-		runTask(ctx, task, onPanic)
-	})
-}
-
-// Stop requests cooperative cancellation of the Task.
+// Stop requests cooperative cancellation of the task.
 func (h *Handle) Stop() {
 	h.cancel()
 }
 
-// Done is closed after the Task and its panic handler return.
+// Done is closed after the task and its panic policy return.
 func (h *Handle) Done() <-chan struct{} {
 	return h.done
 }
 
-// Wait blocks until the Task and its panic handler return.
+// Wait blocks until the task and its panic policy return.
 func (h *Handle) Wait() {
 	<-h.done
 }
 
-func runTask(ctx context.Context, task Task, onPanic PanicHandler) {
+func runTask(ctx context.Context, task func(ctx context.Context), policy PanicPolicy) {
+	failures := 0
 	for ctx.Err() == nil {
-		retry, panicked := runTaskOnce(ctx, task, onPanic)
+		recovered, panicked := runTaskAttempt(ctx, task)
 		if !panicked {
 			return
 		}
-		if !waitToRestart(ctx, panicRetryDelay(retry)) {
+
+		failures++
+		decision := applyPanicPolicy(policy, recovered, failures)
+		if !decision.Retry {
+			return
+		}
+		if decision.After > 0 && !waitForDelay(ctx, decision.After) {
 			return
 		}
 	}
 }
 
-func runTaskOnce(parent context.Context, task Task, onPanic PanicHandler) (retry PanicRetry, panicked bool) {
+func runTaskAttempt(parent context.Context, task func(ctx context.Context)) (recovered Panic, panicked bool) {
 	ctx, cancel := context.WithCancel(parent)
 	defer func() {
 		cancel()
 		if value := recover(); value != nil {
-			retry = notifyPanic(onPanic, Panic{Value: value, Stack: debug.Stack()})
+			recovered = Panic{Value: value, Stack: debug.Stack()}
 			panicked = true
 		}
 	}()
@@ -104,33 +121,23 @@ func runTaskOnce(parent context.Context, task Task, onPanic PanicHandler) (retry
 	if task != nil {
 		task(ctx)
 	}
-	return PanicRetry90s, false
+	return Panic{}, false
 }
 
-func notifyPanic(handler PanicHandler, recovered Panic) (retry PanicRetry) {
-	if handler == nil {
-		return PanicRetry90s
+func applyPanicPolicy(policy PanicPolicy, recovered Panic, failures int) (decision PanicDecision) {
+	if policy == nil {
+		return PanicDecision{}
 	}
 
-	retry = PanicRetry90s
 	defer func() {
-		_ = recover()
+		if recover() != nil {
+			decision = PanicDecision{}
+		}
 	}()
-	return handler(recovered)
+	return policy(recovered, failures)
 }
 
-func panicRetryDelay(retry PanicRetry) time.Duration {
-	switch retry {
-	case PanicRetry30s:
-		return 30 * time.Second
-	case PanicRetry300s:
-		return 300 * time.Second
-	default:
-		return 90 * time.Second
-	}
-}
-
-func waitToRestart(ctx context.Context, delay time.Duration) bool {
+func waitForDelay(ctx context.Context, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 

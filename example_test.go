@@ -10,27 +10,37 @@ import (
 
 type exampleLease struct{}
 
-func (exampleLease) Acquire(context.Context, string, string, time.Duration) bool {
+func (exampleLease) Action(context.Context, EasyRoutine.LeaseAction, EasyRoutine.LeaseState) bool {
 	return true
 }
 
-func (exampleLease) Renew(context.Context, string, string, time.Duration) bool {
-	return true
+func (exampleLease) GetLogs(context.Context, ...string) ([]EasyRoutine.SupervisorLog, error) {
+	return nil, nil
 }
 
-func (exampleLease) Release(context.Context, string, string) bool {
-	return true
+func (exampleLease) GetStatuses(context.Context, ...string) ([]EasyRoutine.SupervisorStatus, error) {
+	return nil, nil
 }
 
-func ExampleGo() {
-	handle := EasyRoutine.Go(context.Background(), func(context.Context) {
+func ExampleSafeGo() {
+	attempts := 0
+	handle, err := EasyRoutine.SafeGo(context.Background(), func(context.Context) {
+		attempts++
+		if attempts == 1 {
+			panic("temporary failure")
+		}
 		fmt.Println("working")
-	}, func(recovered EasyRoutine.Panic) EasyRoutine.PanicRetry {
-		fmt.Printf("recovered: %v\n", recovered.Value)
-		return EasyRoutine.PanicRetry90s
+	}, func(recovered EasyRoutine.Panic, failures int) EasyRoutine.PanicDecision {
+		fmt.Printf("recovered %v (failure %d)\n", recovered.Value, failures)
+		return EasyRoutine.PanicDecision{Retry: true}
 	})
+	if err != nil {
+		panic(err)
+	}
 	handle.Wait()
-	// Output: working
+	// Output:
+	// recovered temporary failure (failure 1)
+	// working
 }
 
 func ExampleStartUniqueSupervisor() {
@@ -38,10 +48,10 @@ func ExampleStartUniqueSupervisor() {
 		panic(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	supervisor, err := EasyRoutine.StartUniqueSupervisor(ctx, "reports", func(context.Context) {
+	supervisor, err := EasyRoutine.StartUniqueSupervisor(ctx, "reports", func(ctx context.Context) {
 		fmt.Println("unique work")
 		cancel()
-	}, nil)
+	}, func(EasyRoutine.Panic) {}, time.Minute)
 	if err != nil {
 		panic(err)
 	}

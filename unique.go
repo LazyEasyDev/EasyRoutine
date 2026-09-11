@@ -4,16 +4,16 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
 
 const (
-	leaseTTL          = 60 * time.Second
-	heartbeatInterval = 15 * time.Second
-	retryInterval     = 30 * time.Second
-	restartInterval   = 90 * time.Second
-	releaseTimeout    = 8 * time.Second
+	leaseTTL            = 180 * time.Second
+	heartbeatInterval   = 30 * time.Second
+	releaseTimeout      = 30 * time.Second
+	panicReacquireDelay = 300 * time.Second
 )
 
 var (
@@ -24,8 +24,6 @@ var (
 type leaseTiming struct {
 	ttl       time.Duration
 	heartbeat time.Duration
-	retry     time.Duration
-	restart   time.Duration
 	release   time.Duration
 }
 
@@ -34,10 +32,86 @@ type coordinator struct {
 	timing  leaseTiming
 }
 
+type taskAttemptResult struct {
+	recovered Panic
+	panicked  bool
+}
+
+type supervisorState struct {
+	mu           sync.RWMutex
+	status       RoutineStatus
+	successCount int64
+	failureCount int64
+	log          string
+}
+
+func newSupervisorState() *supervisorState {
+	return &supervisorState{status: RoutineNotStarted}
+}
+
+func (s *supervisorState) snapshot(name, owner string, ttl time.Duration) LeaseState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return LeaseState{
+		Name:         name,
+		Owner:        owner,
+		TTL:          ttl,
+		Status:       s.status,
+		SuccessCount: s.successCount,
+		FailureCount: s.failureCount,
+		Log:          s.log,
+	}
+}
+
+func (s *supervisorState) notStarted() {
+	s.mu.Lock()
+	s.status = RoutineNotStarted
+	s.log = ""
+	s.mu.Unlock()
+}
+
+func (s *supervisorState) running() {
+	s.mu.Lock()
+	s.status = RoutineRunning
+	s.log = ""
+	s.mu.Unlock()
+}
+
+func (s *supervisorState) done(succeeded bool) {
+	s.mu.Lock()
+	s.status = RoutineDone
+	if succeeded {
+		s.successCount++
+	}
+	s.log = ""
+	s.mu.Unlock()
+}
+
+func (s *supervisorState) panicked(recovered Panic) {
+	s.mu.Lock()
+	s.status = RoutinePanic
+	s.failureCount++
+	s.log = fmt.Sprintf("%v\n%s", recovered.Value, recovered.Stack)
+	s.mu.Unlock()
+}
+
+// uniqueTask configures work that repeats while its supervisor owns the lease.
+type uniqueTask struct {
+	// Run performs one task attempt. It should observe ctx to support cancellation.
+	Run func(ctx context.Context)
+	// RepeatAfter is the delay after a normal return. Zero repeats immediately;
+	// negative values are invalid.
+	RepeatAfter time.Duration
+}
+
 // UniqueSupervisor controls and observes a persistent distributed task supervisor.
 type UniqueSupervisor struct {
 	handle *Handle
 }
+
+// SupervisorPanicHandler observes a panic from a uniquely supervised task.
+// Recovery policy is fixed; the handler does not control when work resumes.
+type SupervisorPanicHandler func(Panic)
 
 // InitLease sets the backend used by StartUniqueSupervisor. It may be called only once.
 func InitLease(backend LeaseProvider) error {
@@ -55,8 +129,6 @@ func InitLease(backend LeaseProvider) error {
 		timing: leaseTiming{
 			ttl:       leaseTTL,
 			heartbeat: heartbeatInterval,
-			retry:     retryInterval,
-			restart:   restartInterval,
 			release:   releaseTimeout,
 		},
 	}
@@ -64,90 +136,187 @@ func InitLease(backend LeaseProvider) error {
 }
 
 // StartUniqueSupervisor supervises task while this process owns its distributed lease.
-// It keeps acquiring ownership and restarting task until ctx is canceled or Stop is called.
-// The context must not be nil.
+// Normal returns retain the lease for restart; panics release it before reacquisition.
+// Supervision continues until ctx is canceled or Stop is called.
+// The context, task, and panic handler are required. A negative repeat delay
+// is invalid. Invalid arguments are returned before a goroutine is started.
 // InitLease must be called before StartUniqueSupervisor.
-func StartUniqueSupervisor(ctx context.Context, name string, task Task, onPanic PanicHandler) (*UniqueSupervisor, error) {
+func StartUniqueSupervisor(ctx context.Context, name string, run func(context.Context), onPanic SupervisorPanicHandler, repeatAfter time.Duration) (*UniqueSupervisor, error) {
+	if ctx == nil {
+		return nil, errors.New("context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateRoutineName(name); err != nil {
+		return nil, err
+	}
+	if run == nil {
+		return nil, errors.New("task is required")
+	}
+	if onPanic == nil {
+		return nil, errors.New("panic handler is required")
+	}
+	if repeatAfter < 0 {
+		return nil, errors.New("task repeat delay must not be negative")
+	}
+
 	coordinatorMu.RLock()
 	configured := defaultCoordinator
 	coordinatorMu.RUnlock()
 	if configured == nil {
 		return nil, errors.New("lease provider is not initialized")
 	}
-	return configured.startUniqueSupervisor(ctx, name, task, onPanic)
+	return configured.startUniqueSupervisor(ctx, name, uniqueTask{Run: run, RepeatAfter: repeatAfter}, onPanic)
 }
 
-func (c *coordinator) startUniqueSupervisor(ctx context.Context, name string, task Task, onPanic PanicHandler) (*UniqueSupervisor, error) {
-	if name == "" {
-		return nil, errors.New("task name is required")
+func (c *coordinator) startUniqueSupervisor(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) (*UniqueSupervisor, error) {
+	if err := validateRoutineName(name); err != nil {
+		return nil, err
 	}
-	if task == nil {
+	if task.Run == nil {
 		return nil, errors.New("task is required")
 	}
+	if task.RepeatAfter < 0 {
+		return nil, errors.New("task repeat delay must not be negative")
+	}
 
-	owner := rand.Text()
 	handle := startHandle(ctx, func(ctx context.Context) {
-		c.run(ctx, name, owner, task, onPanic)
+		c.run(ctx, name, task, onPanic)
 	})
 	return &UniqueSupervisor{handle: handle}, nil
 }
 
-func (c *coordinator) run(ctx context.Context, name, owner string, task Task, onPanic PanicHandler) {
+func (c *coordinator) run(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) {
+	state := newSupervisorState()
 	for ctx.Err() == nil {
-		if c.acquire(ctx, name, owner) && c.runAsOwner(ctx, name, owner, task, onPanic) {
-			return
+		owner := rand.Text()
+		state.notStarted()
+		if c.action(ctx, LeaseAcquire, state.snapshot(name, owner, c.timing.ttl)) {
+			stop, recovered := c.runAsOwner(ctx, name, owner, task, state)
+			if stop {
+				return
+			}
+			if recovered != nil {
+				if !c.waitAfterPanic(ctx, name, owner, state, onPanic, *recovered) {
+					return
+				}
+				continue
+			}
 		}
 
-		if !waitForRetry(ctx, c.timing.retry) {
+		if !waitForDelay(ctx, c.timing.heartbeat) {
 			return
 		}
 	}
 }
 
-func (c *coordinator) runAsOwner(ctx context.Context, name, owner string, task Task, onPanic PanicHandler) bool {
+func (c *coordinator) runAsOwner(ctx context.Context, name, owner string, task uniqueTask, state *supervisorState) (stop bool, recovered *Panic) {
 	if ctx.Err() != nil {
-		c.release(name, owner)
-		return true
+		state.done(false)
+		c.release(name, owner, state)
+		return true, nil
 	}
 
 	heartbeatCtx, stopHeartbeat := context.WithCancel(context.WithoutCancel(ctx))
 	heartbeatDone := make(chan struct{})
-	go c.maintainLease(heartbeatCtx, name, owner, heartbeatDone)
+	go c.maintainLease(heartbeatCtx, name, owner, state, heartbeatDone)
 	defer func() {
 		stopHeartbeat()
 		<-heartbeatDone
-		c.release(name, owner)
+		if recovered == nil {
+			c.release(name, owner, state)
+		}
 	}()
 
 	for {
 		if ctx.Err() != nil {
-			return true
+			state.done(false)
+			return true, nil
 		}
 		select {
 		case <-heartbeatDone:
-			return false
+			return false, nil
 		default:
 		}
 
-		taskHandle := launch(ctx, task, onPanic)
+		state.running()
+		attemptResult := make(chan taskAttemptResult, 1)
+		taskHandle := startHandle(ctx, func(ctx context.Context) {
+			recovered, panicked := runTaskAttempt(ctx, task.Run)
+			attemptResult <- taskAttemptResult{recovered: recovered, panicked: panicked}
+		})
 		select {
 		case <-ctx.Done():
 			taskHandle.Wait()
-			return true
+			state.done(false)
+			return true, nil
 		case <-taskHandle.Done():
+			result := <-attemptResult
+			if ctx.Err() != nil {
+				state.done(false)
+				return true, nil
+			}
+			if result.panicked {
+				state.panicked(result.recovered)
+				return false, &result.recovered
+			}
+			state.done(true)
+			select {
+			case <-heartbeatDone:
+				return false, nil
+			default:
+			}
 		case <-heartbeatDone:
 			taskHandle.Stop()
 			taskHandle.Wait()
-			return false
+			state.done(false)
+			return false, nil
 		}
 
-		if !waitToRestartAsOwner(ctx, heartbeatDone, c.timing.restart) {
-			return ctx.Err() != nil
+		if !waitForNextCycleAsOwner(ctx, heartbeatDone, task.RepeatAfter) {
+			if ctx.Err() != nil {
+				return true, nil
+			}
+			return false, nil
 		}
 	}
 }
 
-func (c *coordinator) maintainLease(ctx context.Context, name, owner string, done chan<- struct{}) {
+func notifySupervisorPanic(handler SupervisorPanicHandler, recovered Panic) {
+	if handler == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	handler(recovered)
+}
+
+func (c *coordinator) waitAfterPanic(ctx context.Context, name, owner string, state *supervisorState, handler SupervisorPanicHandler, recovered Panic) bool {
+	reacquireAt := time.Now().Add(panicReacquireDelay)
+	released := c.releaseWithin(name, owner, state, min(c.timing.release, panicReacquireDelay))
+	notifySupervisorPanic(handler, recovered)
+
+	for {
+		remaining := time.Until(reacquireAt)
+		if remaining <= 0 {
+			return ctx.Err() == nil
+		}
+
+		if released {
+			return waitForDelay(ctx, time.Until(reacquireAt))
+		}
+		if !waitForDelay(ctx, min(c.timing.heartbeat, remaining)) {
+			return false
+		}
+
+		remaining = time.Until(reacquireAt)
+		if remaining > 0 {
+			released = c.releaseWithin(name, owner, state, min(c.timing.release, remaining))
+		}
+	}
+}
+
+func (c *coordinator) maintainLease(ctx context.Context, name, owner string, state *supervisorState, done chan<- struct{}) {
 	defer close(done)
 	defer func() { _ = recover() }()
 	ticker := time.NewTicker(c.timing.heartbeat)
@@ -159,7 +328,7 @@ func (c *coordinator) maintainLease(ctx context.Context, name, owner string, don
 			return
 		case <-ticker.C:
 			renewCtx, cancel := context.WithTimeout(ctx, c.timing.heartbeat)
-			renewed := c.renew(renewCtx, name, owner)
+			renewed := c.action(renewCtx, LeaseRenew, state.snapshot(name, owner, c.timing.ttl))
 			cancel()
 			if !renewed {
 				return
@@ -168,7 +337,7 @@ func (c *coordinator) maintainLease(ctx context.Context, name, owner string, don
 	}
 }
 
-func waitToRestartAsOwner(ctx context.Context, heartbeatDone <-chan struct{}, delay time.Duration) bool {
+func waitForNextCycleAsOwner(ctx context.Context, heartbeatDone <-chan struct{}, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 
@@ -187,54 +356,36 @@ func waitToRestartAsOwner(ctx context.Context, heartbeatDone <-chan struct{}, de
 	}
 }
 
-func waitForRetry(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
-func (c *coordinator) acquire(ctx context.Context, name, owner string) (acquired bool) {
+func (c *coordinator) action(ctx context.Context, action LeaseAction, state LeaseState) (applied bool) {
 	defer func() {
 		if recover() != nil {
-			acquired = false
+			applied = false
 		}
 	}()
-	return c.backend.Acquire(ctx, name, owner, c.timing.ttl)
+	return c.backend.Action(ctx, action, state)
 }
 
-func (c *coordinator) renew(ctx context.Context, name, owner string) (renewed bool) {
-	defer func() {
-		if recover() != nil {
-			renewed = false
-		}
-	}()
-	return c.backend.Renew(ctx, name, owner, c.timing.ttl)
+func (c *coordinator) release(name, owner string, state *supervisorState) bool {
+	return c.releaseWithin(name, owner, state, c.timing.release)
 }
 
-func (c *coordinator) release(name, owner string) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timing.release)
+func (c *coordinator) releaseWithin(name, owner string, state *supervisorState, timeout time.Duration) (released bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	defer func() { _ = recover() }()
-	c.backend.Release(ctx, name, owner)
+	return c.action(ctx, LeaseRelease, state.snapshot(name, owner, c.timing.ttl))
 }
 
-// Stop requests cooperative cancellation of the supervised Task.
+// Stop requests cooperative cancellation of the supervised task.
 func (s *UniqueSupervisor) Stop() {
 	s.handle.Stop()
 }
 
-// Done is closed after supervision and Task cleanup finish.
+// Done is closed after supervision and task cleanup finish.
 func (s *UniqueSupervisor) Done() <-chan struct{} {
 	return s.handle.Done()
 }
 
-// Wait blocks until supervision and Task cleanup finish.
+// Wait blocks until supervision and task cleanup finish.
 func (s *UniqueSupervisor) Wait() {
 	s.handle.Wait()
 }
