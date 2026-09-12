@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"reflect"
 	"runtime"
 	"strings"
@@ -12,6 +13,16 @@ import (
 	"testing"
 	"time"
 )
+
+func TestSupervisorStateCountersSaturate(t *testing.T) {
+	state := &supervisorState{successCount: math.MaxInt64, failureCount: math.MaxInt64}
+	state.done(true)
+	state.panicked(Panic{Value: "boom"})
+	snapshot := state.snapshot("reports", "worker-1", time.Second)
+	if snapshot.SuccessCount != math.MaxInt64 || snapshot.FailureCount != math.MaxInt64 {
+		t.Fatalf("overflowed counters = (%d, %d)", snapshot.SuccessCount, snapshot.FailureCount)
+	}
+}
 
 type memoryLease struct {
 	mu      sync.Mutex

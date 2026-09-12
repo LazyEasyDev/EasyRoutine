@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sync"
 	"time"
@@ -98,7 +99,7 @@ func (s *supervisorState) running() {
 func (s *supervisorState) done(succeeded bool) {
 	s.mu.Lock()
 	s.status = RoutineDone
-	if succeeded {
+	if succeeded && s.successCount < math.MaxInt64 {
 		s.successCount++
 	}
 	s.log = ""
@@ -108,7 +109,9 @@ func (s *supervisorState) done(succeeded bool) {
 func (s *supervisorState) panicked(recovered Panic) {
 	s.mu.Lock()
 	s.status = RoutinePanic
-	s.failureCount++
+	if s.failureCount < math.MaxInt64 {
+		s.failureCount++
+	}
 	s.log = fmt.Sprintf("%v\n%s", recovered.Value, recovered.Stack)
 	s.mu.Unlock()
 }

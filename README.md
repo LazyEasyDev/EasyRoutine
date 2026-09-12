@@ -111,7 +111,9 @@ registering the backend. Call it exactly once per process. Multiple processes
 may initialize against the same shared database during startup.
 
 The database user must be allowed to execute the schema statements. Startup
-creates missing objects but does not alter or validate existing tables.
+creates missing objects but does not alter or validate existing table schemas.
+For Oracle existing-object conflicts, it verifies the expected object type and
+the log index's leading column before continuing.
 
 Supported dialects:
 
@@ -125,6 +127,10 @@ Supported dialects:
 | SQL Server | `SQLServer` |
 | GaussDB | `SQLGaussDB` |
 | Oracle | `SQLOracle` |
+
+History pruning requires `ROW_NUMBER()` support. In particular, use MySQL 8.0+
+or MariaDB 10.2+; similarly old releases of the other engines that do not
+support window functions are not compatible.
 
 SQLite coordinates only processes that can safely access the same database
 file. Use a server database when processes run on different hosts.
@@ -215,8 +221,10 @@ Fixed timings:
 | Panic cooldown | 300 seconds | Delay before the panicked process competes again |
 
 SQL renewal retries once after a 10-second, context-aware delay when execution
-returns an error. A successful statement affecting zero rows is not retried;
-it means ownership was not confirmed.
+returns an error. A successful statement affecting zero rows is not retried.
+For MySQL-family drivers, which normally report changed rather than matched
+rows, a zero-change renewal performs an owner-and-expiration read to confirm the
+lease. On other dialects, zero affected rows means ownership was not confirmed.
 
 ## Handles and Cancellation
 
@@ -282,7 +290,8 @@ expiration, so it may describe a previous owner.
 
 `SuccessCount` and `FailureCount` belong to one in-process supervisor started by
 `StartUniqueSupervisor`. They persist if that same supervisor reacquires a
-lease and reset when a new supervisor is started.
+lease, reset when a new supervisor is started, and saturate at the maximum
+signed 64-bit value rather than wrapping.
 
 Current state is sampled during lease operations:
 
@@ -331,6 +340,25 @@ schedule heartbeats, delays, and timeouts.
 ClickHouse is intentionally unsupported because its normal mutation model does
 not provide the uniqueness-enforcing row operations required by this lease
 protocol.
+
+## Real Database Integration Tests
+
+The build-tagged integration suite executes the schema, ownership, renewal,
+history, query, supervisor, and process-contention paths against a real SQL
+backend. Set the dialect and driver DSN, then run:
+
+```sh
+EASYROUTINE_TEST_DIALECT=postgresql \
+EASYROUTINE_TEST_DSN='postgres://user:password@localhost/database?sslmode=disable' \
+go test -tags=integration -count=1 -timeout=20m -run '^TestRealSQLBackend$' ./...
+```
+
+Supported values are `postgresql`, `mysql`, `mariadb`, `tidb`, `sqlite`,
+`sqlserver`, `gaussdb`, and `oracle`. The suite defaults to 128 simultaneous
+lease contenders over six rounds, 32 competing supervisors, and 12 independent
+worker processes. Larger stress runs can set `EASYROUTINE_TEST_CONTENDERS`,
+`EASYROUTINE_TEST_CONTENTION_ROUNDS`, `EASYROUTINE_TEST_SUPERVISORS`, and
+`EASYROUTINE_TEST_PROCESSES` to positive integers.
 
 ## Distributed Safety
 

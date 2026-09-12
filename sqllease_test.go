@@ -27,6 +27,13 @@ type sqlExecCall struct {
 	args  []any
 }
 
+type sqlStateError struct {
+	state string
+}
+
+func (e sqlStateError) Error() string    { return "SQLSTATE " + e.state }
+func (e sqlStateError) SQLState() string { return e.state }
+
 type sqlQueryStep struct {
 	columns  []string
 	rows     [][]driver.Value
@@ -295,6 +302,47 @@ func TestTTLSecondsRoundsUp(t *testing.T) {
 	}
 }
 
+func TestMySQLRenewConfirmsZeroChangeMatchedRow(t *testing.T) {
+	executor := &scriptedSQLExecer{
+		steps: []sqlExecStep{{rows: 0}},
+		querySteps: []sqlQueryStep{{
+			columns: []string{"owned"},
+			rows:    [][]driver.Value{{int64(1)}},
+		}},
+	}
+	db := sql.OpenDB(scriptedSQLConnector{executor: executor})
+	t.Cleanup(func() { _ = db.Close() })
+	backend, err := newSQLLease(db, SQLMySQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := leaseState{Name: "reports", Owner: "worker-1", TTL: time.Second, Status: RoutineRunning}
+	if !backend.Action(context.Background(), LeaseRenew, state) {
+		t.Fatal("zero-change MySQL renewal did not confirm matched ownership")
+	}
+	if len(executor.queryCalls) != 1 {
+		t.Fatalf("ownership confirmation queries = %d, want 1", len(executor.queryCalls))
+	}
+	assertSQLCall(t, executor.queryCalls, 0, mySQLLeaseStatements.confirmRenew, routineID("reports"), "worker-1")
+}
+
+func TestMySQLRenewRejectsZeroChangeWithoutOwnership(t *testing.T) {
+	executor := &scriptedSQLExecer{
+		steps:      []sqlExecStep{{rows: 0}},
+		querySteps: []sqlQueryStep{{columns: []string{"owned"}}},
+	}
+	db := sql.OpenDB(scriptedSQLConnector{executor: executor})
+	t.Cleanup(func() { _ = db.Close() })
+	backend, err := newSQLLease(db, SQLMySQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := leaseState{Name: "reports", Owner: "worker-1", TTL: time.Second, Status: RoutineRunning}
+	if backend.Action(context.Background(), LeaseRenew, state) {
+		t.Fatal("zero-change MySQL renewal confirmed absent ownership")
+	}
+}
+
 func TestInitSQLLeaseValidatesConfiguration(t *testing.T) {
 	if err := InitSQLLease(context.Background(), nil, SQLPostgreSQL); err == nil {
 		t.Fatal("expected missing database error")
@@ -370,6 +418,24 @@ func TestInitSQLLeaseDoesNotRegisterAfterLogSchemaFailure(t *testing.T) {
 	}
 	if defaultCoordinator != nil {
 		t.Fatal("lease provider was registered after log schema failure")
+	}
+}
+
+func TestSQLLeaseRetriesConcurrentSchemaConflicts(t *testing.T) {
+	executor := &scriptedSQLExecer{steps: []sqlExecStep{
+		{execErr: sqlStateError{state: "23505"}}, {},
+		{execErr: sqlStateError{state: "42P07"}}, {},
+		{execErr: sqlStateError{state: "42710"}}, {},
+	}}
+	backend, err := newSQLLease(executor, SQLPostgreSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.ensureSchema(context.Background()); err != nil {
+		t.Fatalf("schema initialization did not recover from concurrent DDL: %v", err)
+	}
+	if len(executor.calls) != 6 {
+		t.Fatalf("schema calls = %d, want 6 after one retry per object", len(executor.calls))
 	}
 }
 
@@ -1051,6 +1117,14 @@ func TestOracleSchemaCreationVerifiesExistingObjectIsTable(t *testing.T) {
 	}
 	if !strings.Contains(oracleLeaseStatements.create, "FROM USER_TABLES") {
 		t.Fatal("Oracle schema creation does not verify the existing object is a table")
+	}
+}
+
+func TestOracleSchemaCreationVerifiesExistingIndexDefinition(t *testing.T) {
+	for _, required := range []string{"USER_IND_COLUMNS", "TABLE_NAME = 'unique_routine_log'", "COLUMN_NAME = 'routine_id'", "COLUMN_POSITION = 1"} {
+		if !strings.Contains(oracleLogStatements.createIndex, required) {
+			t.Fatalf("Oracle index creation does not verify %q", required)
+		}
 	}
 }
 

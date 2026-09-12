@@ -501,7 +501,12 @@ BEGIN
 			IF SQLCODE != -955 THEN
 				RAISE;
 			END IF;
-			SELECT COUNT(*) INTO index_count FROM USER_INDEXES WHERE INDEX_NAME = 'unique_routine_log_routine_id';
+			SELECT COUNT(*) INTO index_count
+			FROM USER_IND_COLUMNS
+			WHERE INDEX_NAME = 'unique_routine_log_routine_id'
+			  AND TABLE_NAME = 'unique_routine_log'
+			  AND COLUMN_NAME = 'routine_id'
+			  AND COLUMN_POSITION = 1;
 			IF index_count = 0 THEN
 				RAISE;
 			END IF;

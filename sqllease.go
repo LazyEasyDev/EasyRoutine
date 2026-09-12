@@ -11,7 +11,11 @@ import (
 	"time"
 )
 
-const sqlRenewRetryDelay = 10 * time.Second
+const (
+	sqlRenewRetryDelay  = 10 * time.Second
+	sqlSchemaRetryDelay = 200 * time.Millisecond
+	sqlSchemaMaxRetries = 4
+)
 
 var sqlLeaseInitMu sync.Mutex
 
@@ -48,6 +52,7 @@ type sqlLeaseStatements struct {
 	acquireExisting string
 	acquireNew      string
 	renew           string
+	confirmRenew    string
 	release         string
 	ttlArgument     func(time.Duration) (int64, bool)
 	selectBase      string
@@ -118,18 +123,46 @@ func (s *sqlLease) ensureSchema(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return errors.New("SQL lease is not initialized")
 	}
-	if _, err := s.db.ExecContext(ctx, s.statements.create); err != nil {
+	if err := s.ensureSchemaObject(ctx, s.statements.create); err != nil {
 		return fmt.Errorf("create unique_routine table: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, s.logs.create); err != nil {
+	if err := s.ensureSchemaObject(ctx, s.logs.create); err != nil {
 		return fmt.Errorf("create unique_routine_log table: %w", err)
 	}
 	if s.logs.createIndex != "" {
-		if _, err := s.db.ExecContext(ctx, s.logs.createIndex); err != nil {
+		if err := s.ensureSchemaObject(ctx, s.logs.createIndex); err != nil {
 			return fmt.Errorf("create unique_routine_log routine ID index: %w", err)
 		}
 	}
 	return nil
+}
+
+func (s *sqlLease) ensureSchemaObject(ctx context.Context, statement string) error {
+	for attempt := 0; ; attempt++ {
+		_, err := s.db.ExecContext(ctx, statement)
+		if err == nil {
+			return nil
+		}
+		if attempt >= sqlSchemaMaxRetries || !retryableSchemaRace(err) {
+			return err
+		}
+		if !waitForDelay(ctx, sqlSchemaRetryDelay) {
+			return ctx.Err()
+		}
+	}
+}
+
+func retryableSchemaRace(err error) bool {
+	var sqlState interface{ SQLState() string }
+	if !errors.As(err, &sqlState) {
+		return false
+	}
+	switch sqlState.SQLState() {
+	case "23505", "42P07", "42710":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *sqlLease) acquireState(ctx context.Context, state leaseState, ttlArgument int64) bool {
@@ -161,14 +194,38 @@ func (s *sqlLease) renewState(ctx context.Context, state leaseState, ttlArgument
 	result, err := s.db.ExecContext(ctx, s.statements.renew,
 		args...)
 	if err == nil {
-		return rowsAffected(result)
+		if rowsAffected(result) {
+			return true
+		}
+		return s.confirmRenewState(ctx, state)
 	}
 	if ctx.Err() != nil || !waitForDelay(ctx, s.renewRetryDelay) {
 		return false
 	}
 
 	result, err = s.db.ExecContext(ctx, s.statements.renew, args...)
-	return err == nil && rowsAffected(result)
+	if err != nil {
+		return false
+	}
+	if rowsAffected(result) {
+		return true
+	}
+	return s.confirmRenewState(ctx, state)
+}
+
+func (s *sqlLease) confirmRenewState(ctx context.Context, state leaseState) bool {
+	// MySQL-family drivers normally report changed rather than matched rows. A
+	// same-second renewal can therefore return zero even though its owner guard
+	// matched; confirm that the lease written by that update is still live.
+	if s.statements.confirmRenew == "" || s.query == nil {
+		return false
+	}
+	rows, err := s.query(ctx, s.statements.confirmRenew, routineID(state.Name), state.Owner)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	return rows.Next()
 }
 
 func (s *sqlLease) releaseState(ctx context.Context, state leaseState) bool {
@@ -302,6 +359,7 @@ VALUES (?, ?, ?, ` + mySQLCurrentSeconds + ` + ?, ?, ?, ?, ?, ` + mySQLCurrentSe
 	` + "`log`" + ` = ?,
 	` + "`updated_at`" + ` = ` + mySQLCurrentSeconds + `
 WHERE ` + "`routine_id`" + ` = ? AND ` + "`owner`" + ` = ? AND ` + "`expires_at`" + ` > ` + mySQLCurrentSeconds,
+	confirmRenew: `SELECT 1 FROM ` + "`unique_routine`" + ` WHERE ` + "`routine_id`" + ` = ? AND ` + "`owner`" + ` = ? AND ` + "`expires_at`" + ` > ` + mySQLCurrentSeconds,
 	release: `UPDATE ` + "`unique_routine`" + `
 SET ` + "`expires_at`" + ` = ` + mySQLCurrentSeconds + `,
 	` + "`status`" + ` = ?,
