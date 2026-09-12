@@ -91,6 +91,9 @@ func TestRealSQLBackend(t *testing.T) {
 	t.Run("SupervisorHandoff", func(t *testing.T) {
 		testRealSupervisorHandoff(t, backend)
 	})
+	t.Run("ParallelDistinctSupervisors", func(t *testing.T) {
+		testRealParallelDistinctSupervisors(t, backend)
+	})
 	t.Run("ContentionAcrossProcesses", func(t *testing.T) {
 		lockPath := t.TempDir() + "/active-worker"
 		runRealWorkers(t, realProcessWorkerCount(), map[string]string{
@@ -265,6 +268,20 @@ func testRealOwnershipAndQueries(t *testing.T, backend *sqlLease) {
 		if history[name][index-1].CreatedAt > history[name][index].CreatedAt {
 			t.Fatalf("history is not oldest-first: %#v", history[name])
 		}
+	}
+	allStatuses, err := backend.GetStatuses(ctx)
+	if err != nil {
+		t.Fatalf("query unfiltered statuses: %v", err)
+	}
+	if allStatuses[name].Name != name || allStatuses[name].Owner != second.Owner {
+		t.Fatalf("unfiltered statuses omitted or changed %q: %#v", name, allStatuses[name])
+	}
+	allHistory, err := backend.GetLogs(ctx)
+	if err != nil {
+		t.Fatalf("query unfiltered history: %v", err)
+	}
+	if len(allHistory[name]) != len(history[name]) {
+		t.Fatalf("unfiltered history for %q has %d records, want %d", name, len(allHistory[name]), len(history[name]))
 	}
 }
 
@@ -589,6 +606,241 @@ func testRealSupervisorHandoff(t *testing.T, backend *sqlLease) {
 	}
 }
 
+func testRealParallelDistinctSupervisors(t *testing.T, backend *sqlLease) {
+	nameCount := realParallelNameCount()
+	replicasPerName := realParallelReplicaCount()
+	if nameCount < 4 {
+		t.Fatal("parallel distinct-name test requires at least four names")
+	}
+	if replicasPerName < 2 {
+		t.Fatal("parallel distinct-name test requires at least two replicas per name")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	defer cancel()
+	coordinator := realParallelCoordinator(backend)
+	base := integrationRoutineName(t, "parallel-distinct")
+	names := make([]string, nameCount)
+	activeByName := make([]atomic.Int64, nameCount)
+	startsByName := make([]atomic.Int64, nameCount)
+	handles := make([]*Handle, 0, nameCount*replicasPerName)
+	finishWork := make(chan struct{})
+	allStarted := make(chan struct{})
+	var allStartedOnce sync.Once
+	var firstStarts atomic.Int64
+	var totalActive atomic.Int64
+	var maximumActive atomic.Int64
+	var overlapDetected atomic.Bool
+
+	for nameIndex := 0; nameIndex < nameCount; nameIndex++ {
+		names[nameIndex] = realParallelRoutineName(base, nameIndex)
+		for range replicasPerName {
+			index := nameIndex
+			handle := coordinator.startUniqueSupervisor(ctx, names[index], uniqueTask{
+				Run: func(taskContext context.Context) {
+					starts := startsByName[index].Add(1)
+					activeForName := activeByName[index].Add(1)
+					activeTotal := totalActive.Add(1)
+					updateAtomicMaximum(&maximumActive, activeTotal)
+					if starts != 1 || activeForName != 1 {
+						overlapDetected.Store(true)
+					}
+					if starts == 1 && firstStarts.Add(1) == int64(nameCount) {
+						allStartedOnce.Do(func() { close(allStarted) })
+					}
+					select {
+					case <-finishWork:
+					case <-taskContext.Done():
+					}
+					totalActive.Add(-1)
+					activeByName[index].Add(-1)
+				},
+				RepeatAfter: time.Hour,
+			}, func(Panic) {})
+			handles = append(handles, handle)
+		}
+	}
+
+	select {
+	case <-allStarted:
+	case <-ctx.Done():
+		t.Fatalf("only %d of %d distinct routines started: %v", firstStarts.Load(), nameCount, ctx.Err())
+	}
+	if overlapDetected.Load() {
+		t.Fatal("multiple supervisors ran simultaneously for at least one distinct routine name")
+	}
+	if got := totalActive.Load(); got != int64(nameCount) {
+		t.Fatalf("simultaneously active distinct routines = %d, want %d", got, nameCount)
+	}
+	if got := maximumActive.Load(); got != int64(nameCount) {
+		t.Fatalf("maximum parallel distinct routines = %d, want %d", got, nameCount)
+	}
+
+	runningStatuses := waitForRealStatuses(t, ctx, backend, names, "running", func(statuses SupervisorStatuses) bool {
+		if len(statuses) != nameCount {
+			return false
+		}
+		for _, name := range names {
+			status := statuses[name]
+			if status.Name != name || status.Status != RoutineRunning || status.Owner == "" || status.SuccessCount != 0 || status.FailureCount != 0 || status.Log != serverLog("") || status.UpdatedAt <= 0 || status.ExpiresAt <= status.UpdatedAt {
+				return false
+			}
+		}
+		return true
+	})
+	owners := make(map[string]string, nameCount)
+	seenOwners := make(map[string]string, nameCount)
+	for _, name := range names {
+		owner := runningStatuses[name].Owner
+		if previousName, exists := seenOwners[owner]; exists {
+			t.Fatalf("owner %q was shared by distinct names %q and %q", owner, previousName, name)
+		}
+		owners[name] = owner
+		seenOwners[owner] = name
+	}
+
+	close(finishWork)
+	// A normal task return retains its lease during RepeatAfter, so standby
+	// replicas cannot take over while the final done snapshots are observed.
+	waitForRealStatuses(t, ctx, backend, names, "done", func(statuses SupervisorStatuses) bool {
+		if len(statuses) != nameCount {
+			return false
+		}
+		for _, name := range names {
+			status := statuses[name]
+			if status.Status != RoutineDone || status.SuccessCount != 1 || status.FailureCount != 0 || status.Owner != owners[name] {
+				return false
+			}
+		}
+		return true
+	})
+	cancel()
+	waitForRealHandles(t, handles, 30*time.Second)
+
+	queryCtx, queryCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer queryCancel()
+	statuses, err := backend.GetStatuses(queryCtx, names...)
+	if err != nil {
+		t.Fatalf("query final parallel statuses: %v", err)
+	}
+	history, err := backend.GetLogs(queryCtx, names...)
+	if err != nil {
+		t.Fatalf("query parallel histories: %v", err)
+	}
+	if len(statuses) != nameCount || len(history) != nameCount {
+		t.Fatalf("parallel result sizes: statuses=%d history=%d want=%d", len(statuses), len(history), nameCount)
+	}
+	for index, name := range names {
+		if starts := startsByName[index].Load(); starts != 1 {
+			t.Fatalf("routine %q started %d times, want 1", name, starts)
+		}
+		status := statuses[name]
+		if status.Name != name || status.Owner != owners[name] || status.Status != RoutineDone || status.SuccessCount != 1 || status.FailureCount != 0 || status.Log != serverLog("") || !realTimestampsClose(status.ExpiresAt, status.UpdatedAt) {
+			t.Fatalf("incorrect final parallel status for %q: %#v", name, status)
+		}
+		if len(history[name]) != 2 {
+			t.Fatalf("parallel history for %q has %d records, want acquire and release", name, len(history[name]))
+		}
+		var acquired, released bool
+		for _, log := range history[name] {
+			if log.ID == "" || log.Name != name || log.Owner != owners[name] || log.CreatedAt <= 0 {
+				t.Fatalf("crossed parallel history for %q: %#v", name, log)
+			}
+			switch log.Action {
+			case LeaseAcquire:
+				if log.Status != RoutineNotStarted {
+					t.Fatalf("parallel acquire history for %q has status %q", name, log.Status)
+				}
+				acquired = true
+			case LeaseRelease:
+				if log.Status != RoutineDone {
+					t.Fatalf("parallel release history for %q has status %q", name, log.Status)
+				}
+				released = true
+			default:
+				t.Fatalf("unexpected parallel history action for %q: %#v", name, log)
+			}
+		}
+		if !acquired || !released {
+			t.Fatalf("parallel history for %q lacks acquire or release: %#v", name, history[name])
+		}
+	}
+}
+
+func waitForRealStatuses(t *testing.T, ctx context.Context, backend *sqlLease, names []string, description string, ready func(SupervisorStatuses) bool) SupervisorStatuses {
+	t.Helper()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var lastStatuses SupervisorStatuses
+	var lastErr error
+	for {
+		lastStatuses, lastErr = backend.GetStatuses(ctx, names...)
+		if lastErr == nil && ready(lastStatuses) {
+			return lastStatuses
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("parallel statuses did not become %s: %v; last error=%v statuses=%#v", description, ctx.Err(), lastErr, lastStatuses)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForRealHandles(t *testing.T, handles []*Handle, timeout time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for index, handle := range handles {
+		select {
+		case <-handle.Done():
+		case <-ctx.Done():
+			for _, remaining := range handles[index:] {
+				remaining.Stop()
+			}
+			t.Fatalf("%d parallel supervisor handles did not finish within %s", len(handles)-index, timeout)
+		}
+	}
+}
+
+func updateAtomicMaximum(maximum *atomic.Int64, candidate int64) {
+	for {
+		current := maximum.Load()
+		if candidate <= current || maximum.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
+}
+
+func realTimestampsClose(left, right int64) bool {
+	if left <= 0 || right <= 0 {
+		return false
+	}
+	difference := left - right
+	return difference >= -1 && difference <= 1
+}
+
+func realParallelRoutineName(base string, index int) string {
+	switch index {
+	case 0:
+		return base + "-identity"
+	case 1:
+		return base + "-IDENTITY"
+	case 2:
+		return base + "-caf\u00e9"
+	case 3:
+		return base + "-cafe\u0301"
+	}
+	switch index % 4 {
+	case 0:
+		return fmt.Sprintf("%s-lower-%03d", base, index)
+	case 1:
+		return fmt.Sprintf("%s-UPPER-%03d", base, index)
+	case 2:
+		return fmt.Sprintf("%s-世界-%03d", base, index)
+	default:
+		return fmt.Sprintf("%s.dot_%03d", base, index)
+	}
+}
+
 func runRealLeaseWorker(t *testing.T, backend *sqlLease) {
 	lockPath := os.Getenv("EASYROUTINE_TEST_LOCK_PATH")
 	if lockPath == "" {
@@ -688,6 +940,17 @@ func realTestCoordinator(backend *sqlLease) *coordinator {
 	}
 }
 
+func realParallelCoordinator(backend *sqlLease) *coordinator {
+	return &coordinator{
+		backend: backend,
+		timing: leaseTiming{
+			ttl:       20 * time.Second,
+			heartbeat: 2 * time.Second,
+			release:   5 * time.Second,
+		},
+	}
+}
+
 func integrationRoutineName(t *testing.T, suffix string) string {
 	t.Helper()
 	return fmt.Sprintf("integration-%s-%d", suffix, time.Now().UnixNano())
@@ -715,6 +978,14 @@ func realSupervisorWorkerCount() int {
 
 func realProcessWorkerCount() int {
 	return realPositiveEnvironmentInt("EASYROUTINE_TEST_PROCESSES", 12)
+}
+
+func realParallelNameCount() int {
+	return realPositiveEnvironmentInt("EASYROUTINE_TEST_PARALLEL_NAMES", 32)
+}
+
+func realParallelReplicaCount() int {
+	return realPositiveEnvironmentInt("EASYROUTINE_TEST_PARALLEL_REPLICAS", 3)
 }
 
 func realPositiveEnvironmentInt(name string, fallback int) int {

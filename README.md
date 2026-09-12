@@ -84,8 +84,10 @@ each application process before starting supervisors or querying SQL state.
 
 ### Initialize SQL
 
-The application opens and imports its own `database/sql` driver. EasyRoutine
-does not include a database driver. This example uses PostgreSQL with pgx:
+The application opens and imports its own `database/sql` driver. Normal
+EasyRoutine builds do not import or link a database driver; the repository's
+`integration`-tagged tests register their test drivers from `go.mod`. This
+example uses PostgreSQL with pgx:
 
 ```go
 import (
@@ -358,7 +360,12 @@ Supported values are `postgresql`, `mysql`, `mariadb`, `tidb`, `sqlite`,
 lease contenders over six rounds, 32 competing supervisors, and 12 independent
 worker processes. Larger stress runs can set `EASYROUTINE_TEST_CONTENDERS`,
 `EASYROUTINE_TEST_CONTENTION_ROUNDS`, `EASYROUTINE_TEST_SUPERVISORS`, and
-`EASYROUTINE_TEST_PROCESSES` to positive integers.
+`EASYROUTINE_TEST_PROCESSES` to positive integers. Distinct-name parallelism is
+controlled by `EASYROUTINE_TEST_PARALLEL_NAMES` and
+`EASYROUTINE_TEST_PARALLEL_REPLICAS`; these default to 32 names with three
+competing supervisors per name. The name count must be at least four and the
+replica count at least two. This workload also includes names differing only by
+case or Unicode normalization.
 
 ## Distributed Safety
 
