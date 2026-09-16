@@ -107,13 +107,14 @@ func (s *supervisorState) done(succeeded bool) {
 }
 
 func (s *supervisorState) panicked(recovered Panic) {
+	log := fmt.Sprintf("%v\n%s", recovered.Value, recovered.Stack)
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.status = RoutinePanic
 	if s.failureCount < math.MaxInt64 {
 		s.failureCount++
 	}
-	s.log = fmt.Sprintf("%v\n%s", recovered.Value, recovered.Stack)
-	s.mu.Unlock()
+	s.log = log
 }
 
 // uniqueTask configures work that repeats while its supervisor owns the lease.
@@ -190,7 +191,7 @@ func StartUniqueSupervisor(ctx context.Context, name string, run func(context.Co
 func (c *coordinator) startUniqueSupervisor(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) *Handle {
 	return startHandle(ctx, func(ctx context.Context) {
 		c.run(ctx, name, task, onPanic)
-	})
+	}, activeHandles)
 }
 
 func (c *coordinator) run(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) {
@@ -252,7 +253,7 @@ func (c *coordinator) runAsOwner(ctx context.Context, name, owner string, task u
 			defer close(attemptResult)
 			recovered, panicked := runTaskAttempt(ctx, task.Run)
 			attemptResult <- taskAttemptResult{recovered: recovered, panicked: panicked}
-		})
+		}, nil)
 		select {
 		case <-ctx.Done():
 			taskHandle.Wait()
@@ -260,11 +261,7 @@ func (c *coordinator) runAsOwner(ctx context.Context, name, owner string, task u
 			return true, nil
 		case <-taskHandle.Done():
 			result, completed := <-attemptResult
-			if !completed {
-				state.done(false)
-				return true, nil
-			}
-			if ctx.Err() != nil {
+			if !completed || ctx.Err() != nil {
 				state.done(false)
 				return true, nil
 			}

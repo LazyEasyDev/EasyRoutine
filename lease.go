@@ -132,17 +132,17 @@ func validateRoutineName(name string) error {
 // Methods must return promptly after ctx is canceled.
 // Action's result describes only the ownership change; log persistence must not
 // change a successful result to false. Query methods with no names return all
-// records. GetLogs groups records by exact routine name and orders each history
+// records. GetSupervisorLogs groups records by exact routine name and orders each history
 // from oldest to newest.
 type leaseProvider interface {
 	Action(ctx context.Context, action LeaseAction, state leaseState) bool
-	GetStatuses(ctx context.Context, names ...string) (SupervisorStatuses, error)
-	GetLogs(ctx context.Context, names ...string) (SupervisorHistory, error)
+	GetSupervisorStatuses(ctx context.Context, names ...string) (SupervisorStatuses, error)
+	GetSupervisorLogs(ctx context.Context, names ...string) (SupervisorHistory, error)
 }
 
-// GetStatuses returns current supervisor states keyed by exact routine name for
+// GetSupervisorStatuses returns current supervisor states keyed by exact routine name for
 // all tasks or only the supplied names.
-func GetStatuses(ctx context.Context, names ...string) (statuses SupervisorStatuses, err error) {
+func GetSupervisorStatuses(ctx context.Context, names ...string) (statuses SupervisorStatuses, err error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
@@ -168,12 +168,12 @@ func GetStatuses(ctx context.Context, names ...string) (statuses SupervisorStatu
 			err = errors.New("lease provider panicked while getting statuses")
 		}
 	}()
-	return configured.backend.GetStatuses(ctx, names...)
+	return configured.backend.GetSupervisorStatuses(ctx, names...)
 }
 
-// GetLogs returns retained supervisor logs grouped by exact routine name for
+// GetSupervisorLogs returns retained supervisor logs grouped by exact routine name for
 // all names or only the supplied names. Each history is ordered oldest first.
-func GetLogs(ctx context.Context, names ...string) (logs SupervisorHistory, err error) {
+func GetSupervisorLogs(ctx context.Context, names ...string) (logs SupervisorHistory, err error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
@@ -199,5 +199,5 @@ func GetLogs(ctx context.Context, names ...string) (logs SupervisorHistory, err 
 			err = errors.New("lease provider panicked while getting logs")
 		}
 	}()
-	return configured.backend.GetLogs(ctx, names...)
+	return configured.backend.GetSupervisorLogs(ctx, names...)
 }

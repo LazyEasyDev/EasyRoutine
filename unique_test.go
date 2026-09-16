@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -22,6 +23,113 @@ func TestSupervisorStateCountersSaturate(t *testing.T) {
 	if snapshot.SuccessCount != math.MaxInt64 || snapshot.FailureCount != math.MaxInt64 {
 		t.Fatalf("overflowed counters = (%d, %d)", snapshot.SuccessCount, snapshot.FailureCount)
 	}
+}
+
+type goexitPanicValue struct{}
+
+func (goexitPanicValue) String() string {
+	runtime.Goexit()
+	return ""
+}
+
+func TestSupervisorPanicFormattingGoexitDoesNotLockState(t *testing.T) {
+	state := newSupervisorState()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		state.panicked(Panic{Value: goexitPanicValue{}})
+	}()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("panic formatting did not finish")
+	}
+	if !state.mu.TryLock() {
+		t.Fatal("panic formatting left the supervisor state mutex locked")
+	}
+	state.mu.Unlock()
+	state.snapshot("reports", "worker-1", time.Second)
+}
+
+func TestSupervisorPanicFormattingGoexitCleansUp(t *testing.T) {
+	Wait()
+	synctest.Test(t, func(t *testing.T) {
+		resetDefaultCoordinator(t)
+		backend := &recordingLease{}
+		if err := initLease(backend); err != nil {
+			t.Fatal(err)
+		}
+		started := make(chan struct{})
+		panicNow := make(chan struct{})
+		var handled atomic.Int32
+		supervisor, err := StartUniqueSupervisor(context.Background(), "formatting-goexit", func(ctx context.Context) {
+			close(started)
+			select {
+			case <-panicNow:
+				panic(goexitPanicValue{})
+			case <-ctx.Done():
+			}
+		}, func(Panic) {
+			handled.Add(1)
+		}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			supervisor.Stop()
+			waitForSignal(t, supervisor.Done())
+		})
+		waitForSignal(t, started)
+		waitDone := make(chan struct{})
+		go func() {
+			Wait()
+			close(waitDone)
+		}()
+		synctest.Wait()
+		select {
+		case <-waitDone:
+			t.Fatal("Wait returned while the supervisor was running")
+		default:
+		}
+		time.Sleep(heartbeatInterval)
+		synctest.Wait()
+		actions := backend.recordedActions()
+		if len(actions) != 2 || actions[0].action != LeaseAcquire || actions[1].action != LeaseRenew {
+			t.Fatalf("actions before panic = %#v, want acquisition and renewal", actions)
+		}
+
+		close(panicNow)
+		waitForSignal(t, supervisor.Done())
+		waitForSignal(t, waitDone)
+		synctest.Wait()
+		actions = backend.recordedActions()
+		if len(actions) != 3 || actions[2].action != LeaseRelease {
+			t.Fatalf("actions after Goexit = %#v, want one final release", actions)
+		}
+		if actions[2].state.Owner != actions[0].state.Owner {
+			t.Fatal("release did not use the acquired owner token")
+		}
+		backend.mu.Lock()
+		owner := backend.owner
+		backend.mu.Unlock()
+		if owner != "" {
+			t.Fatalf("lease still owned after completion: %q", owner)
+		}
+		activeHandles.mu.Lock()
+		_, tracked := activeHandles.handles[supervisor]
+		activeHandles.mu.Unlock()
+		if tracked {
+			t.Fatal("completed supervisor remains in the registry")
+		}
+		if handled.Load() != 0 {
+			t.Fatal("Goexit during formatting unexpectedly invoked the panic handler")
+		}
+		time.Sleep(2 * heartbeatInterval)
+		synctest.Wait()
+		if later := backend.recordedActions(); len(later) != len(actions) {
+			t.Fatalf("lease activity continued after supervisor completion: %#v", later)
+		}
+	})
 }
 
 type memoryLease struct {
@@ -92,20 +200,20 @@ type panicLogLease struct {
 	memoryLease
 }
 
-func (*panicLogLease) GetLogs(context.Context, ...string) (SupervisorHistory, error) {
+func (*panicLogLease) GetSupervisorLogs(context.Context, ...string) (SupervisorHistory, error) {
 	panic("log query failed")
 }
 
-func (*panicLogLease) GetStatuses(context.Context, ...string) (SupervisorStatuses, error) {
+func (*panicLogLease) GetSupervisorStatuses(context.Context, ...string) (SupervisorStatuses, error) {
 	panic("status query failed")
 }
 
-func (l *logQueryLease) GetLogs(_ context.Context, names ...string) (SupervisorHistory, error) {
+func (l *logQueryLease) GetSupervisorLogs(_ context.Context, names ...string) (SupervisorHistory, error) {
 	l.names = append([]string(nil), names...)
 	return l.logs, nil
 }
 
-func (l *logQueryLease) GetStatuses(_ context.Context, names ...string) (SupervisorStatuses, error) {
+func (l *logQueryLease) GetSupervisorStatuses(_ context.Context, names ...string) (SupervisorStatuses, error) {
 	l.statusNames = append([]string(nil), names...)
 	return l.statuses, nil
 }
@@ -242,27 +350,27 @@ func (m *memoryLease) Action(_ context.Context, action LeaseAction, state leaseS
 	}
 }
 
-func (*memoryLease) GetLogs(context.Context, ...string) (SupervisorHistory, error) {
+func (*memoryLease) GetSupervisorLogs(context.Context, ...string) (SupervisorHistory, error) {
 	return nil, nil
 }
 
-func (*memoryLease) GetStatuses(context.Context, ...string) (SupervisorStatuses, error) {
+func (*memoryLease) GetSupervisorStatuses(context.Context, ...string) (SupervisorStatuses, error) {
 	return nil, nil
 }
 
-func (*panicAcquireLease) GetLogs(context.Context, ...string) (SupervisorHistory, error) {
+func (*panicAcquireLease) GetSupervisorLogs(context.Context, ...string) (SupervisorHistory, error) {
 	return nil, nil
 }
 
-func (*panicAcquireLease) GetStatuses(context.Context, ...string) (SupervisorStatuses, error) {
+func (*panicAcquireLease) GetSupervisorStatuses(context.Context, ...string) (SupervisorStatuses, error) {
 	return nil, nil
 }
 
-func (panicReleaseLease) GetLogs(context.Context, ...string) (SupervisorHistory, error) {
+func (panicReleaseLease) GetSupervisorLogs(context.Context, ...string) (SupervisorHistory, error) {
 	return nil, nil
 }
 
-func (panicReleaseLease) GetStatuses(context.Context, ...string) (SupervisorStatuses, error) {
+func (panicReleaseLease) GetSupervisorStatuses(context.Context, ...string) (SupervisorStatuses, error) {
 	return nil, nil
 }
 
@@ -287,6 +395,57 @@ func TestUniqueSupervisorUsesInitializedBackend(t *testing.T) {
 	waitForSignal(t, started)
 	cancel()
 	supervisor.Wait()
+}
+
+func TestWaitIncludesUniqueSupervisor(t *testing.T) {
+	Wait()
+	synctest.Test(t, func(t *testing.T) {
+		resetDefaultCoordinator(t)
+		if err := initLease(&memoryLease{}); err != nil {
+			t.Fatal(err)
+		}
+
+		started := make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		supervisor, err := StartUniqueSupervisor(ctx, "reports", func(ctx context.Context) {
+			close(started)
+			<-ctx.Done()
+		}, func(Panic) {}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			cancel()
+			supervisor.Wait()
+		})
+		waitForSignal(t, started)
+
+		waitDone := make(chan struct{})
+		go func() {
+			Wait()
+			close(waitDone)
+		}()
+		synctest.Wait()
+		select {
+		case <-waitDone:
+			t.Fatal("Wait returned while a unique supervisor was running")
+		default:
+		}
+		activeHandles.mu.Lock()
+		_, supervisorTracked := activeHandles.handles[supervisor]
+		trackedCount := len(activeHandles.handles)
+		activeHandles.mu.Unlock()
+		if !supervisorTracked || trackedCount != 1 {
+			t.Fatalf("tracked handles = %d, outer supervisor tracked = %t; want only the outer supervisor", trackedCount, supervisorTracked)
+		}
+
+		cancel()
+		select {
+		case <-waitDone:
+		case <-time.After(time.Second):
+			t.Fatal("Wait did not return after the unique supervisor completed")
+		}
+	})
 }
 
 func TestUniqueSupervisorStopsAfterTaskGoexit(t *testing.T) {
@@ -960,7 +1119,7 @@ func TestSupervisorQueryResultsJSON(t *testing.T) {
 	}
 }
 
-func TestGetLogsUsesInitializedBackend(t *testing.T) {
+func TestGetSupervisorLogsUsesInitializedBackend(t *testing.T) {
 	resetDefaultCoordinator(t)
 	want := SupervisorHistory{"reports": {{ID: "log-1", Name: "reports"}}}
 	backend := &logQueryLease{logs: want}
@@ -968,7 +1127,7 @@ func TestGetLogsUsesInitializedBackend(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	logs, err := GetLogs(context.Background(), "reports", "billing")
+	logs, err := GetSupervisorLogs(context.Background(), "reports", "billing")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -979,7 +1138,7 @@ func TestGetLogsUsesInitializedBackend(t *testing.T) {
 		t.Fatalf("names = %#v, want selected names", backend.names)
 	}
 
-	if _, err := GetLogs(context.Background()); err != nil {
+	if _, err := GetSupervisorLogs(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(backend.names) != 0 {
@@ -987,7 +1146,7 @@ func TestGetLogsUsesInitializedBackend(t *testing.T) {
 	}
 }
 
-func TestGetStatusesUsesInitializedBackend(t *testing.T) {
+func TestGetSupervisorStatusesUsesInitializedBackend(t *testing.T) {
 	resetDefaultCoordinator(t)
 	want := SupervisorStatuses{"reports": {Name: "reports", Status: RoutineRunning}}
 	backend := &logQueryLease{statuses: want}
@@ -995,7 +1154,7 @@ func TestGetStatusesUsesInitializedBackend(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	statuses, err := GetStatuses(context.Background(), "reports", "billing")
+	statuses, err := GetSupervisorStatuses(context.Background(), "reports", "billing")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1006,7 +1165,7 @@ func TestGetStatusesUsesInitializedBackend(t *testing.T) {
 		t.Fatalf("names = %#v, want selected names", backend.statusNames)
 	}
 
-	if _, err := GetStatuses(context.Background()); err != nil {
+	if _, err := GetSupervisorStatuses(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(backend.statusNames) != 0 {
@@ -1014,66 +1173,66 @@ func TestGetStatusesUsesInitializedBackend(t *testing.T) {
 	}
 }
 
-func TestGetLogsValidatesRequest(t *testing.T) {
+func TestGetSupervisorLogsValidatesRequest(t *testing.T) {
 	resetDefaultCoordinator(t)
 	var nilContext context.Context
-	if _, err := GetLogs(nilContext); err == nil {
+	if _, err := GetSupervisorLogs(nilContext); err == nil {
 		t.Fatal("expected nil context error")
 	}
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := GetLogs(canceledCtx); !errors.Is(err, context.Canceled) {
+	if _, err := GetSupervisorLogs(canceledCtx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled context error = %v, want context.Canceled", err)
 	}
-	if _, err := GetLogs(context.Background(), ""); err == nil {
+	if _, err := GetSupervisorLogs(context.Background(), ""); err == nil {
 		t.Fatal("expected empty task name error")
 	}
-	if _, err := GetLogs(context.Background(), "line\nbreak"); err == nil {
+	if _, err := GetSupervisorLogs(context.Background(), "line\nbreak"); err == nil {
 		t.Fatal("expected control character error")
 	}
-	if _, err := GetLogs(context.Background()); err == nil {
+	if _, err := GetSupervisorLogs(context.Background()); err == nil {
 		t.Fatal("expected uninitialized provider error")
 	}
 }
 
-func TestGetStatusesValidatesRequest(t *testing.T) {
+func TestGetSupervisorStatusesValidatesRequest(t *testing.T) {
 	resetDefaultCoordinator(t)
 	var nilContext context.Context
-	if _, err := GetStatuses(nilContext); err == nil {
+	if _, err := GetSupervisorStatuses(nilContext); err == nil {
 		t.Fatal("expected nil context error")
 	}
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := GetStatuses(canceledCtx); !errors.Is(err, context.Canceled) {
+	if _, err := GetSupervisorStatuses(canceledCtx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled context error = %v, want context.Canceled", err)
 	}
-	if _, err := GetStatuses(context.Background(), ""); err == nil {
+	if _, err := GetSupervisorStatuses(context.Background(), ""); err == nil {
 		t.Fatal("expected empty task name error")
 	}
-	if _, err := GetStatuses(context.Background(), " trailing "); err == nil {
+	if _, err := GetSupervisorStatuses(context.Background(), " trailing "); err == nil {
 		t.Fatal("expected surrounding whitespace error")
 	}
-	if _, err := GetStatuses(context.Background()); err == nil {
+	if _, err := GetSupervisorStatuses(context.Background()); err == nil {
 		t.Fatal("expected uninitialized provider error")
 	}
 }
 
-func TestGetLogsContainsProviderPanic(t *testing.T) {
+func TestGetSupervisorLogsContainsProviderPanic(t *testing.T) {
 	resetDefaultCoordinator(t)
 	if err := initLease(&panicLogLease{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := GetLogs(context.Background()); err == nil || !strings.Contains(err.Error(), "panicked") {
+	if _, err := GetSupervisorLogs(context.Background()); err == nil || !strings.Contains(err.Error(), "panicked") {
 		t.Fatalf("provider panic error = %v, want contained panic", err)
 	}
 }
 
-func TestGetStatusesContainsProviderPanic(t *testing.T) {
+func TestGetSupervisorStatusesContainsProviderPanic(t *testing.T) {
 	resetDefaultCoordinator(t)
 	if err := initLease(&panicLogLease{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := GetStatuses(context.Background()); err == nil || !strings.Contains(err.Error(), "panicked") {
+	if _, err := GetSupervisorStatuses(context.Background()); err == nil || !strings.Contains(err.Error(), "panicked") {
 		t.Fatalf("provider panic error = %v, want contained panic", err)
 	}
 }

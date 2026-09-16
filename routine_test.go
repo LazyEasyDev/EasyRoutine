@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -20,6 +21,76 @@ func mustSafeGo(t *testing.T, ctx context.Context, task func(context.Context), p
 		t.Fatal(err)
 	}
 	return handle
+}
+
+func TestWaitIncludesSafeGoStartedWhileWaiting(t *testing.T) {
+	Wait()
+	synctest.Test(t, func(t *testing.T) {
+		firstStarted := make(chan struct{})
+		firstRelease := make(chan struct{})
+		first := mustSafeGo(t, context.Background(), func(ctx context.Context) {
+			close(firstStarted)
+			select {
+			case <-firstRelease:
+			case <-ctx.Done():
+			}
+		}, noRetryPolicy)
+		t.Cleanup(func() {
+			first.Stop()
+			first.Wait()
+		})
+		<-firstStarted
+
+		waitDone := make(chan struct{})
+		go func() {
+			Wait()
+			close(waitDone)
+		}()
+		synctest.Wait()
+		select {
+		case <-waitDone:
+			t.Fatal("Wait returned while the first SafeGo was running")
+		default:
+		}
+
+		secondStarted := make(chan struct{})
+		secondRelease := make(chan struct{})
+		second := mustSafeGo(t, context.Background(), func(ctx context.Context) {
+			close(secondStarted)
+			select {
+			case <-secondRelease:
+			case <-ctx.Done():
+			}
+		}, noRetryPolicy)
+		t.Cleanup(func() {
+			second.Stop()
+			second.Wait()
+		})
+		<-secondStarted
+
+		close(firstRelease)
+		first.Wait()
+		synctest.Wait()
+		select {
+		case <-waitDone:
+			t.Fatal("Wait returned while a later SafeGo was still running")
+		default:
+		}
+
+		close(secondRelease)
+		select {
+		case <-waitDone:
+		case <-time.After(time.Second):
+			t.Fatal("Wait did not return after all SafeGo handles completed")
+		}
+
+		activeHandles.mu.Lock()
+		remaining := len(activeHandles.handles)
+		activeHandles.mu.Unlock()
+		if remaining != 0 {
+			t.Fatalf("active handle count = %d, want 0", remaining)
+		}
+	})
 }
 
 func TestSafeGoRecoversPanic(t *testing.T) {

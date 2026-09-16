@@ -57,17 +57,23 @@ func SafeGo(ctx context.Context, task func(ctx context.Context), policy PanicPol
 
 	return startHandle(ctx, func(ctx context.Context) {
 		runTask(ctx, task, policy)
-	}), nil
+	}, activeHandles), nil
 }
 
-func startHandle(parent context.Context, run func(context.Context)) *Handle {
+func startHandle(parent context.Context, run func(context.Context), registry *handleRegistry) *Handle {
 	ctx, cancel := context.WithCancel(parent)
 	handle := &Handle{
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
+	if registry != nil {
+		registry.add(handle)
+	}
 
 	go func() {
+		if registry != nil {
+			defer registry.remove(handle)
+		}
 		defer close(handle.done)
 		defer cancel()
 		run(ctx)

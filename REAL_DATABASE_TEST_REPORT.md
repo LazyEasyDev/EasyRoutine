@@ -52,7 +52,7 @@ After the assertions were strengthened to require exact live/final log and times
 ## Scenarios Executed Per Matrix
 
 1. Concurrent schema initialization across processes.
-2. Exported `InitSQLLease` and `GetStatuses` initialization path.
+2. Exported `InitSQLLease` and `GetSupervisorStatuses` initialization path.
 3. Initial acquisition, live-lease exclusion, owner renewal, non-owner renewal rejection, idempotent release, and filtered plus unfiltered non-empty status/history queries.
 4. Database-clock expiry, replacement-owner takeover, stale renew rejection, and stale release fencing.
 5. Maximum UTF-8 name, large Unicode log, and signed 64-bit counter round trip.

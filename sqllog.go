@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 const retainedLogsPerRoutineID = 25
+const sqlLogTimeout = 10 * time.Second
 
 // Keep each filter below Oracle's IN-list and older SQLite variable limits.
 const sqlNameFilterBatchSize = 900
@@ -51,9 +53,9 @@ func (s *sqlLease) Action(ctx context.Context, action LeaseAction, state leaseSt
 	return applied
 }
 
-// GetLogs returns retained records grouped by exact routine name. Each history
+// GetSupervisorLogs returns retained records grouped by exact routine name. Each history
 // is ordered oldest first. With no names it returns logs for every task.
-func (s *sqlLease) GetLogs(ctx context.Context, names ...string) (SupervisorHistory, error) {
+func (s *sqlLease) GetSupervisorLogs(ctx context.Context, names ...string) (SupervisorHistory, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
@@ -159,9 +161,9 @@ func (s *sqlLease) queryLogs(ctx context.Context, query string, args []any) (Sup
 	return history, nil
 }
 
-// GetStatuses returns one current state per exact routine name. With no names it
+// GetSupervisorStatuses returns one current state per exact routine name. With no names it
 // returns every current state; otherwise it filters by the supplied names.
-func (s *sqlLease) GetStatuses(ctx context.Context, names ...string) (SupervisorStatuses, error) {
+func (s *sqlLease) GetSupervisorStatuses(ctx context.Context, names ...string) (SupervisorStatuses, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
@@ -298,6 +300,8 @@ func (s *sqlLease) recordLog(ctx context.Context, action LeaseAction, state leas
 	defer func() {
 		_ = recover()
 	}()
+	ctx, cancel := context.WithTimeout(ctx, sqlLogTimeout)
+	defer cancel()
 
 	_, err := s.db.ExecContext(
 		ctx,

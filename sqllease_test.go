@@ -38,6 +38,7 @@ type sqlQueryStep struct {
 	columns  []string
 	rows     [][]driver.Value
 	queryErr error
+	nextErr  error
 }
 
 type scriptedSQLExecer struct {
@@ -145,13 +146,14 @@ func (c scriptedSQLConn) QueryContext(_ context.Context, query string, args []dr
 	if step.queryErr != nil {
 		return nil, step.queryErr
 	}
-	return &scriptedSQLRows{columns: step.columns, rows: step.rows}, nil
+	return &scriptedSQLRows{columns: step.columns, rows: step.rows, nextErr: step.nextErr}, nil
 }
 
 type scriptedSQLRows struct {
 	columns []string
 	rows    [][]driver.Value
 	index   int
+	nextErr error
 }
 
 func TestRoutineIDUsesSHA256(t *testing.T) {
@@ -169,6 +171,9 @@ func (*scriptedSQLRows) Close() error        { return nil }
 
 func (r *scriptedSQLRows) Next(values []driver.Value) error {
 	if r.index >= len(r.rows) {
+		if r.nextErr != nil {
+			return r.nextErr
+		}
 		return io.EOF
 	}
 	copy(values, r.rows[r.index])
@@ -796,7 +801,7 @@ func TestSQLLeaseActionDoesNotLogFailedOwnershipOperation(t *testing.T) {
 	}
 }
 
-func TestSQLLeaseGetLogsFiltersNamesAndGroupsHistory(t *testing.T) {
+func TestSQLLeaseGetSupervisorLogsFiltersNamesAndGroupsHistory(t *testing.T) {
 	columns := []string{"id", "name", "owner", "action", "status", "log", "created_at"}
 	newest := time.Date(2026, time.September, 10, 12, 0, 0, 0, time.UTC).Unix()
 	older := newest - int64(time.Hour/time.Second)
@@ -818,7 +823,7 @@ func TestSQLLeaseGetLogsFiltersNamesAndGroupsHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	logs, err := backend.GetLogs(context.Background(), "name1", "name2")
+	logs, err := backend.GetSupervisorLogs(context.Background(), "name1", "name2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -842,7 +847,7 @@ func TestSQLLeaseGetLogsFiltersNamesAndGroupsHistory(t *testing.T) {
 	filteredQuery := postgreSQLLogStatements.selectBase + ` WHERE "routine_id" IN ($1, $2)`
 	assertSQLCall(t, executor.queryCalls, 0, filteredQuery, routineID("name1"), routineID("name2"))
 
-	if _, err := backend.GetLogs(context.Background()); err != nil {
+	if _, err := backend.GetSupervisorLogs(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	assertSQLCall(t, executor.queryCalls, 1, postgreSQLLogStatements.selectRoutineIDs)
@@ -850,7 +855,7 @@ func TestSQLLeaseGetLogsFiltersNamesAndGroupsHistory(t *testing.T) {
 	assertSQLCall(t, executor.queryCalls, 2, allLogsQuery, routineID("name1"))
 }
 
-func TestSQLLeaseGetStatusesFiltersNames(t *testing.T) {
+func TestSQLLeaseGetSupervisorStatusesFiltersNames(t *testing.T) {
 	columns := []string{"name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at"}
 	expiresAt := time.Date(2026, time.September, 10, 12, 5, 0, 0, time.UTC).Unix()
 	updatedAt := expiresAt - int64(time.Minute/time.Second)
@@ -867,7 +872,7 @@ func TestSQLLeaseGetStatusesFiltersNames(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	statuses, err := backend.GetStatuses(context.Background(), "reports")
+	statuses, err := backend.GetSupervisorStatuses(context.Background(), "reports")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -900,7 +905,7 @@ func TestSQLLeaseQueriesReturnEmptyMaps(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	history, err := backend.GetLogs(context.Background())
+	history, err := backend.GetSupervisorLogs(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -908,7 +913,7 @@ func TestSQLLeaseQueriesReturnEmptyMaps(t *testing.T) {
 		t.Fatalf("history = %#v, want non-nil empty map", history)
 	}
 
-	statuses, err := backend.GetStatuses(context.Background())
+	statuses, err := backend.GetSupervisorStatuses(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -917,7 +922,7 @@ func TestSQLLeaseQueriesReturnEmptyMaps(t *testing.T) {
 	}
 }
 
-func TestSQLLeaseGetLogsDeduplicatesAndBatchesNames(t *testing.T) {
+func TestSQLLeaseGetSupervisorLogsDeduplicatesAndBatchesNames(t *testing.T) {
 	columns := []string{"id", "name", "owner", "action", "status", "log", "created_at"}
 	latest := time.Date(2026, time.September, 10, 12, 0, 0, 0, time.UTC)
 	executor := &scriptedSQLExecer{querySteps: []sqlQueryStep{
@@ -948,7 +953,7 @@ func TestSQLLeaseGetLogsDeduplicatesAndBatchesNames(t *testing.T) {
 	}
 	names = append(names, names[0])
 
-	logs, err := backend.GetLogs(context.Background(), names...)
+	logs, err := backend.GetSupervisorLogs(context.Background(), names...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -961,7 +966,7 @@ func TestSQLLeaseGetLogsDeduplicatesAndBatchesNames(t *testing.T) {
 	assertBatchedNameFilterCalls(t, executor.queryCalls, names)
 }
 
-func TestSQLLeaseGetLogsDiscoversAndBatchesAllRoutineIDs(t *testing.T) {
+func TestSQLLeaseGetSupervisorLogsDiscoversAndBatchesAllRoutineIDs(t *testing.T) {
 	columns := []string{"id", "name", "owner", "action", "status", "log", "created_at"}
 	routineIDs := make([]string, sqlNameFilterBatchSize+1)
 	routineIDRows := make([][]driver.Value, len(routineIDs))
@@ -981,7 +986,7 @@ func TestSQLLeaseGetLogsDiscoversAndBatchesAllRoutineIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	logs, err := backend.GetLogs(context.Background())
+	logs, err := backend.GetSupervisorLogs(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -992,7 +997,7 @@ func TestSQLLeaseGetLogsDiscoversAndBatchesAllRoutineIDs(t *testing.T) {
 	assertBatchedRoutineIDFilterCalls(t, executor.queryCalls[1:], routineIDs)
 }
 
-func TestSQLLeaseGetStatusesDeduplicatesAndBatchesNames(t *testing.T) {
+func TestSQLLeaseGetSupervisorStatusesDeduplicatesAndBatchesNames(t *testing.T) {
 	columns := []string{"name", "owner", "status", "success_count", "failure_count", "log", "expires_at", "updated_at"}
 	now := time.Date(2026, time.September, 10, 12, 0, 0, 0, time.UTC)
 	executor := &scriptedSQLExecer{querySteps: []sqlQueryStep{
@@ -1021,7 +1026,7 @@ func TestSQLLeaseGetStatusesDeduplicatesAndBatchesNames(t *testing.T) {
 	}
 	names = append(names, names[0])
 
-	statuses, err := backend.GetStatuses(context.Background(), names...)
+	statuses, err := backend.GetSupervisorStatuses(context.Background(), names...)
 	if err != nil {
 		t.Fatal(err)
 	}

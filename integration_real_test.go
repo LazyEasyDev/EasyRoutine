@@ -125,7 +125,7 @@ func TestRealSQLProcessWorker(t *testing.T) {
 		if err := InitSQLLease(t.Context(), db, config.dialect); err != nil {
 			t.Fatalf("initialize exported SQL lease API: %v", err)
 		}
-		if _, err := GetStatuses(t.Context()); err != nil {
+		if _, err := GetSupervisorStatuses(t.Context()); err != nil {
 			t.Fatalf("query exported SQL lease API: %v", err)
 		}
 	case "lease":
@@ -240,7 +240,7 @@ func testRealOwnershipAndQueries(t *testing.T, backend *sqlLease) {
 		t.Fatal("idempotent non-owner release failed")
 	}
 
-	statuses, err := backend.GetStatuses(ctx, name, name, "missing-real-routine")
+	statuses, err := backend.GetSupervisorStatuses(ctx, name, name, "missing-real-routine")
 	if err != nil {
 		t.Fatalf("query filtered statuses: %v", err)
 	}
@@ -257,7 +257,7 @@ func testRealOwnershipAndQueries(t *testing.T, backend *sqlLease) {
 		t.Fatal("second owner did not release its lease")
 	}
 
-	history, err := backend.GetLogs(ctx, name)
+	history, err := backend.GetSupervisorLogs(ctx, name)
 	if err != nil {
 		t.Fatalf("query filtered history: %v", err)
 	}
@@ -269,14 +269,14 @@ func testRealOwnershipAndQueries(t *testing.T, backend *sqlLease) {
 			t.Fatalf("history is not oldest-first: %#v", history[name])
 		}
 	}
-	allStatuses, err := backend.GetStatuses(ctx)
+	allStatuses, err := backend.GetSupervisorStatuses(ctx)
 	if err != nil {
 		t.Fatalf("query unfiltered statuses: %v", err)
 	}
 	if allStatuses[name].Name != name || allStatuses[name].Owner != second.Owner {
 		t.Fatalf("unfiltered statuses omitted or changed %q: %#v", name, allStatuses[name])
 	}
-	allHistory, err := backend.GetLogs(ctx)
+	allHistory, err := backend.GetSupervisorLogs(ctx)
 	if err != nil {
 		t.Fatalf("query unfiltered history: %v", err)
 	}
@@ -311,7 +311,7 @@ func testRealExpiredLeaseTakeover(t *testing.T, backend *sqlLease) {
 	if !backend.Action(ctx, LeaseRelease, stale) {
 		t.Fatal("stale owner release was not idempotent")
 	}
-	statuses, err := backend.GetStatuses(ctx, name)
+	statuses, err := backend.GetSupervisorStatuses(ctx, name)
 	if err != nil {
 		t.Fatalf("query replacement owner: %v", err)
 	}
@@ -340,7 +340,7 @@ func testRealUnicodeAndLargeValues(t *testing.T, backend *sqlLease) {
 	if !backend.Action(ctx, LeaseRelease, state) {
 		t.Fatal("could not release lease with a 255-byte UTF-8 name and large log")
 	}
-	statuses, err := backend.GetStatuses(ctx, name)
+	statuses, err := backend.GetSupervisorStatuses(ctx, name)
 	if err != nil {
 		t.Fatalf("query Unicode status: %v", err)
 	}
@@ -410,7 +410,7 @@ func testRealConcurrentHistoryPruning(t *testing.T, backend *sqlLease) {
 	if !backend.Action(ctx, LeaseRelease, owner) {
 		t.Fatal("release history pruning owner")
 	}
-	history, err := backend.GetLogs(ctx, name)
+	history, err := backend.GetSupervisorLogs(ctx, name)
 	if err != nil {
 		t.Fatalf("query pruned history: %v", err)
 	}
@@ -433,14 +433,14 @@ func testRealBulkFilteredQueries(t *testing.T, backend *sqlLease) {
 		}
 	}
 	filters := append(append([]string{}, names...), names[0], names[count-1])
-	statuses, err := backend.GetStatuses(ctx, filters...)
+	statuses, err := backend.GetSupervisorStatuses(ctx, filters...)
 	if err != nil {
 		t.Fatalf("query %d filtered statuses: %v", count, err)
 	}
 	if len(statuses) != count {
 		t.Fatalf("queried %d statuses, want %d", len(statuses), count)
 	}
-	history, err := backend.GetLogs(ctx, filters...)
+	history, err := backend.GetSupervisorLogs(ctx, filters...)
 	if err != nil {
 		t.Fatalf("query %d filtered histories: %v", count, err)
 	}
@@ -512,7 +512,7 @@ func testRealSupervisorPanicState(t *testing.T, backend *sqlLease) {
 	if !coordinator.release(name, owner, state) {
 		t.Fatal("panic supervisor did not release lease")
 	}
-	statuses, err := backend.GetStatuses(ctx, name)
+	statuses, err := backend.GetSupervisorStatuses(ctx, name)
 	if err != nil {
 		t.Fatalf("query panic status: %v", err)
 	}
@@ -541,7 +541,7 @@ func testRealSupervisorCancelsOnLeaseLoss(t *testing.T, backend *sqlLease) {
 	case <-ctx.Done():
 		t.Fatal("lease-loss supervisor did not start")
 	}
-	statuses, err := backend.GetStatuses(ctx, name)
+	statuses, err := backend.GetSupervisorStatuses(ctx, name)
 	if err != nil {
 		t.Fatalf("query lease-loss owner: %v", err)
 	}
@@ -718,11 +718,11 @@ func testRealParallelDistinctSupervisors(t *testing.T, backend *sqlLease) {
 
 	queryCtx, queryCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer queryCancel()
-	statuses, err := backend.GetStatuses(queryCtx, names...)
+	statuses, err := backend.GetSupervisorStatuses(queryCtx, names...)
 	if err != nil {
 		t.Fatalf("query final parallel statuses: %v", err)
 	}
-	history, err := backend.GetLogs(queryCtx, names...)
+	history, err := backend.GetSupervisorLogs(queryCtx, names...)
 	if err != nil {
 		t.Fatalf("query parallel histories: %v", err)
 	}
@@ -773,7 +773,7 @@ func waitForRealStatuses(t *testing.T, ctx context.Context, backend *sqlLease, n
 	var lastStatuses SupervisorStatuses
 	var lastErr error
 	for {
-		lastStatuses, lastErr = backend.GetStatuses(ctx, names...)
+		lastStatuses, lastErr = backend.GetSupervisorStatuses(ctx, names...)
 		if lastErr == nil && ready(lastStatuses) {
 			return lastStatuses
 		}

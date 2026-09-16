@@ -191,19 +191,13 @@ func (s *sqlLease) renewState(ctx context.Context, state leaseState, ttlArgument
 		routineID(state.Name),
 		state.Owner,
 	}
-	result, err := s.db.ExecContext(ctx, s.statements.renew,
-		args...)
-	if err == nil {
-		if rowsAffected(result) {
-			return true
+	result, err := s.db.ExecContext(ctx, s.statements.renew, args...)
+	if err != nil {
+		if ctx.Err() != nil || !waitForDelay(ctx, s.renewRetryDelay) {
+			return false
 		}
-		return s.confirmRenewState(ctx, state)
+		result, err = s.db.ExecContext(ctx, s.statements.renew, args...)
 	}
-	if ctx.Err() != nil || !waitForDelay(ctx, s.renewRetryDelay) {
-		return false
-	}
-
-	result, err = s.db.ExecContext(ctx, s.statements.renew, args...)
 	if err != nil {
 		return false
 	}

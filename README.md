@@ -18,9 +18,10 @@ task but only the process holding its SQL lease should run it.
 | `SafeGo` | Run local work with policy-controlled panic retries |
 | `InitSQLLease` | Initialize SQL coordination and create missing schema objects |
 | `StartUniqueSupervisor` | Run persistent work while this process owns its lease |
-| `GetStatuses` | Read current supervisor state from SQL |
-| `GetLogs` | Read retained acquire and release history from SQL |
+| `GetSupervisorStatuses` | Read current supervisor state from SQL |
+| `GetSupervisorLogs` | Read retained acquire and release history from SQL |
 | `Handle` | Stop, wait for, or observe managed work |
+| `Wait` | Wait for all active handles in this process |
 
 ## Install
 
@@ -236,12 +237,27 @@ Both launch functions return `*Handle`.
 handle.Stop()     // request cooperative cancellation
 <-handle.Done()  // wait with a channel
 handle.Wait()    // or wait directly
+
+cancelApp()
+EasyRoutine.Wait() // wait for every active SafeGo and unique supervisor
 ```
 
 `Done` only returns a completion channel; it does not stop work. `Wait` and
 `Done` complete after managed work and cleanup finish. Calling `Stop` more than
 once is safe. Tasks must observe `ctx.Done()` and pass their supplied context to
 blocking operations because EasyRoutine cannot force a function to return.
+
+The package-level `EasyRoutine.Wait()` tracks every handle successfully started
+by `SafeGo` and `StartUniqueSupervisor`. It includes work started while it is
+already blocked and returns at the first synchronized instant when no tracked
+handles remain. Work started after that instant requires another call to
+`EasyRoutine.Wait()`. Completed handles are removed from the internal tracking
+set.
+
+Package-level `Wait` does not stop or cancel work. Cancel the shared application
+context or stop persistent supervisors before calling it during shutdown. Do
+not call it from a managed task, panic policy, or panic handler because that
+would wait for the caller's own handle to complete.
 
 Task functions, panic policies, and panic handlers must not call
 `runtime.Goexit`. It is not a panic, so it does not invoke panic recovery or
@@ -251,20 +267,20 @@ instead.
 
 ## Status and History
 
-`GetStatuses` and `GetLogs` require successful SQL initialization. With no
+`GetSupervisorStatuses` and `GetSupervisorLogs` require successful SQL initialization. With no
 names they return all records. Supplied names use the supervisor-name validation
 rules. Duplicate filters are removed and large filters are queried in bounded
-batches. An all-history `GetLogs` call first discovers stored routine IDs, then
+batches. An all-history `GetSupervisorLogs` call first discovers stored routine IDs, then
 uses the same bounded batches and groups the results by exact routine name.
 
 ```go
-statuses, err := EasyRoutine.GetStatuses(appCtx)
+statuses, err := EasyRoutine.GetSupervisorStatuses(appCtx)
 if err != nil {
 	log.Fatal(err)
 }
 log.Printf("queue status: %+v", statuses["queue-consumer"])
 
-history, err := EasyRoutine.GetLogs(appCtx, "queue-consumer", "billing")
+history, err := EasyRoutine.GetSupervisorLogs(appCtx, "queue-consumer", "billing")
 if err != nil {
 	log.Fatal(err)
 }
@@ -277,8 +293,8 @@ if err != nil {
 log.Printf("statuses: %s", statusJSON)
 ```
 
-`GetStatuses` returns `SupervisorStatuses`, a map from each exact routine name
-to its `SupervisorStatus`. `GetLogs` returns `SupervisorHistory`, a map from
+`GetSupervisorStatuses` returns `SupervisorStatuses`, a map from each exact routine name
+to its `SupervisorStatus`. `GetSupervisorLogs` returns `SupervisorHistory`, a map from
 each exact routine name to its retained log slice. Missing names are omitted,
 and empty results are non-nil empty maps. Each type has a `JSON` method that
 encodes the result as a JSON object; a nil value is encoded as `{}`. Map
@@ -311,6 +327,12 @@ starts with the process's operating system hostname in brackets; normal records
 contain only that prefix. If the hostname is unavailable, the prefix is
 `[unknown]`. History insertion and pruning are best effort. SQL errors from
 either operation do not change a successful lease result.
+
+History insertion and pruning share a single 10-second timeout, capped by any
+earlier parent deadline and canceled when the parent context is canceled. This
+bounds logging time when the SQL driver honors context cancellation; it does
+not bound the preceding ownership SQL operation or guarantee lease validity
+after other delays.
 
 Release is owner-guarded and idempotent. If its owner no longer matches the
 current row, the update is a successful no-op. It cannot alter that row, but it
