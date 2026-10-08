@@ -80,7 +80,7 @@ handle cannot complete until the current task returns.
 
 ## Unique Work Across Processes
 
-Unique supervisors use the built-in SQL lease backend. Initialize it once in
+Unique supervisors use the built-in SQL lease backend. Initialize it in
 each application process before starting supervisors or querying SQL state.
 
 ### Initialize SQL
@@ -110,7 +110,10 @@ if err := EasyRoutine.InitSQLLease(appCtx, db, EasyRoutine.SQLPostgreSQL); err !
 
 `InitSQLLease` validates its inputs, creates missing schema objects, and then
 registers the SQL backend. If schema setup fails, it returns an error without
-registering the backend. Call it exactly once per process. Multiple processes
+registering the backend, so initialization can be retried. Once initialization
+succeeds, subsequent calls with a non-nil context and database return nil without
+repeating schema setup or replacing the backend. The first successful database
+and dialect remain in use. Concurrent calls are serialized. Multiple processes
 may initialize against the same shared database during startup.
 
 The database user must be allowed to execute the schema statements. Startup

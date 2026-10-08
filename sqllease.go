@@ -62,6 +62,8 @@ type sqlLeaseStatements struct {
 
 // InitSQLLease creates the current-state and lifecycle-history tables when
 // needed and registers the resulting provider for StartUniqueSupervisor.
+// After successful initialization, calls with non-nil ctx and db are no-ops;
+// the first database and dialect remain in use. Failed initialization may be retried.
 func InitSQLLease(ctx context.Context, db *sql.DB, dialect SQLDialect) error {
 	if ctx == nil {
 		return errors.New("context is required")
@@ -77,7 +79,7 @@ func InitSQLLease(ctx context.Context, db *sql.DB, dialect SQLDialect) error {
 	initialized := defaultCoordinator != nil
 	coordinatorMu.RUnlock()
 	if initialized {
-		return errors.New("lease provider is already initialized")
+		return nil
 	}
 
 	backend, err := newSQLLease(db, dialect)
