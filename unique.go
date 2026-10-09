@@ -18,11 +18,7 @@ const (
 	panicReacquireDelay = 300 * time.Second
 )
 
-var (
-	coordinatorMu      sync.RWMutex
-	defaultCoordinator *coordinator
-	serverTag          = detectServerTag()
-)
+var serverTag = detectServerTag()
 
 type leaseTiming struct {
 	ttl       time.Duration
@@ -130,39 +126,32 @@ type uniqueTask struct {
 // Recovery policy is fixed; the handler does not control when work resumes.
 type SupervisorPanicHandler func(Panic)
 
-func initLease(backend leaseProvider) error {
-	if backend == nil {
-		return errors.New("lease provider is required")
-	}
-
-	coordinatorMu.Lock()
-	defer coordinatorMu.Unlock()
-	if defaultCoordinator != nil {
-		return errors.New("lease provider is already initialized")
-	}
-	defaultCoordinator = &coordinator{
-		backend: backend,
-		timing: leaseTiming{
-			ttl:       leaseTTL,
-			heartbeat: heartbeatInterval,
-			release:   releaseTimeout,
-		},
-	}
-	return nil
-}
-
 // StartUniqueSupervisor supervises task while this process owns its distributed lease.
 // Normal returns retain the lease for restart; panics release it before reacquisition.
-// Supervision continues until ctx is canceled or Stop is called.
-// The context, task, and panic handler are required. A negative repeat delay
+// It uses the initialized package context and stops on cancellation, Close, or Stop.
+// The task and panic handler are required. A negative repeat delay
 // is invalid. Invalid arguments are returned before a goroutine is started.
 // The task and panic handler must not call runtime.Goexit; if either does,
 // supervision stops without treating Goexit as a panic.
-// InitSQLLease must be called before StartUniqueSupervisor.
-func StartUniqueSupervisor(ctx context.Context, name string, run func(context.Context), onPanic SupervisorPanicHandler, repeatAfter time.Duration) (*Handle, error) {
+// Initialize must succeed with a SQL database before StartUniqueSupervisor.
+func StartUniqueSupervisor(name string, run func(context.Context), onPanic SupervisorPanicHandler, repeatAfter time.Duration) (*Handle, error) {
+	ctx, err := initializedContext()
+	if err != nil {
+		return nil, err
+	}
+	return startUniqueSupervisor(ctx, name, run, onPanic, repeatAfter)
+}
+
+// StartUniqueSupervisorWithCtx uses ctx for task values, deadlines, and
+// cancellation while also obeying the package lifetime. ctx must be non-nil.
+func StartUniqueSupervisorWithCtx(ctx context.Context, name string, run func(context.Context), onPanic SupervisorPanicHandler, repeatAfter time.Duration) (*Handle, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
+	return startUniqueSupervisor(ctx, name, run, onPanic, repeatAfter)
+}
+
+func startUniqueSupervisor(ctx context.Context, name string, run func(context.Context), onPanic SupervisorPanicHandler, repeatAfter time.Duration) (*Handle, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -179,19 +168,19 @@ func StartUniqueSupervisor(ctx context.Context, name string, run func(context.Co
 		return nil, errors.New("task repeat delay must not be negative")
 	}
 
-	coordinatorMu.RLock()
+	lifecycleMu.RLock()
 	configured := defaultCoordinator
-	coordinatorMu.RUnlock()
+	lifecycleMu.RUnlock()
 	if configured == nil {
-		return nil, errors.New("lease provider is not initialized")
+		return nil, errors.New("SQL lease is not initialized")
 	}
-	return configured.startUniqueSupervisor(ctx, name, uniqueTask{Run: run, RepeatAfter: repeatAfter}, onPanic), nil
+	return configured.startUniqueSupervisor(ctx, name, uniqueTask{Run: run, RepeatAfter: repeatAfter}, onPanic)
 }
 
-func (c *coordinator) startUniqueSupervisor(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) *Handle {
-	return startHandle(ctx, func(ctx context.Context) {
+func (c *coordinator) startUniqueSupervisor(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) (*Handle, error) {
+	return startManagedHandle(ctx, func(ctx context.Context) {
 		c.run(ctx, name, task, onPanic)
-	}, activeHandles)
+	})
 }
 
 func (c *coordinator) run(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) {

@@ -155,11 +155,11 @@ func GetSupervisorStatuses(ctx context.Context, names ...string) (statuses Super
 		}
 	}
 
-	coordinatorMu.RLock()
+	lifecycleMu.RLock()
 	configured := defaultCoordinator
-	coordinatorMu.RUnlock()
+	lifecycleMu.RUnlock()
 	if configured == nil {
-		return nil, errors.New("lease provider is not initialized")
+		return nil, errors.New("SQL lease is not initialized")
 	}
 
 	defer func() {
@@ -186,11 +186,11 @@ func GetSupervisorLogs(ctx context.Context, names ...string) (logs SupervisorHis
 		}
 	}
 
-	coordinatorMu.RLock()
+	lifecycleMu.RLock()
 	configured := defaultCoordinator
-	coordinatorMu.RUnlock()
+	lifecycleMu.RUnlock()
 	if configured == nil {
-		return nil, errors.New("lease provider is not initialized")
+		return nil, errors.New("SQL lease is not initialized")
 	}
 
 	defer func() {

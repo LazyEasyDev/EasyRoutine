@@ -36,15 +36,30 @@ type Handle struct {
 	done   chan struct{}
 }
 
-// SafeGo launches a panic-safe goroutine derived from ctx. Its policy decides
-// whether and when a panicked task is retried. The context, task, and policy
-// are required. Invalid arguments are returned before a goroutine is started.
+// SafeGo launches a panic-safe goroutine using the initialized package context.
+// Its policy decides whether and when a panicked task is retried. Initialize
+// must succeed first. The task and policy are required. Invalid arguments are
+// returned before a goroutine is started. Close stops further retries.
 // The task and policy must not call runtime.Goexit; if either does, managed
 // work stops without treating Goexit as a panic.
-func SafeGo(ctx context.Context, task func(ctx context.Context), policy PanicPolicy) (*Handle, error) {
+func SafeGo(task func(ctx context.Context), policy PanicPolicy) (*Handle, error) {
+	ctx, err := initializedContext()
+	if err != nil {
+		return nil, err
+	}
+	return safeGo(ctx, task, policy)
+}
+
+// SafeGoWithCtx uses ctx for task values, deadlines, and cancellation while
+// also obeying the package lifetime. The supplied context must be non-nil.
+func SafeGoWithCtx(ctx context.Context, task func(ctx context.Context), policy PanicPolicy) (*Handle, error) {
 	if ctx == nil {
 		return nil, errors.New("context is required")
 	}
+	return safeGo(ctx, task, policy)
+}
+
+func safeGo(ctx context.Context, task func(ctx context.Context), policy PanicPolicy) (*Handle, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -55,9 +70,9 @@ func SafeGo(ctx context.Context, task func(ctx context.Context), policy PanicPol
 		return nil, errors.New("panic policy is required")
 	}
 
-	return startHandle(ctx, func(ctx context.Context) {
+	return startManagedHandle(ctx, func(ctx context.Context) {
 		runTask(ctx, task, policy)
-	}, activeHandles), nil
+	})
 }
 
 func startHandle(parent context.Context, run func(context.Context), registry *handleRegistry) *Handle {

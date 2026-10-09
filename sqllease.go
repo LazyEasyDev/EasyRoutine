@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 )
 
@@ -16,8 +15,6 @@ const (
 	sqlSchemaRetryDelay = 200 * time.Millisecond
 	sqlSchemaMaxRetries = 4
 )
-
-var sqlLeaseInitMu sync.Mutex
 
 // SQLDialect identifies a database compatibility target.
 type SQLDialect string
@@ -58,38 +55,6 @@ type sqlLeaseStatements struct {
 	selectBase      string
 	routineIDColumn string
 	bindVariable    func(int) string
-}
-
-// InitSQLLease creates the current-state and lifecycle-history tables when
-// needed and registers the resulting provider for StartUniqueSupervisor.
-// After successful initialization, calls with non-nil ctx and db are no-ops;
-// the first database and dialect remain in use. Failed initialization may be retried.
-func InitSQLLease(ctx context.Context, db *sql.DB, dialect SQLDialect) error {
-	if ctx == nil {
-		return errors.New("context is required")
-	}
-	if db == nil {
-		return errors.New("SQL database is required")
-	}
-
-	sqlLeaseInitMu.Lock()
-	defer sqlLeaseInitMu.Unlock()
-
-	coordinatorMu.RLock()
-	initialized := defaultCoordinator != nil
-	coordinatorMu.RUnlock()
-	if initialized {
-		return nil
-	}
-
-	backend, err := newSQLLease(db, dialect)
-	if err != nil {
-		return err
-	}
-	if err := backend.ensureSchema(ctx); err != nil {
-		return err
-	}
-	return initLease(backend)
 }
 
 func newSQLLease(db sqlLeaseExecer, dialect SQLDialect) (*sqlLease, error) {

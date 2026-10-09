@@ -15,12 +15,15 @@ task but only the process holding its SQL lease should run it.
 
 | API | Purpose |
 | --- | --- |
+| `Initialize` | Set the package lifetime and optionally initialize SQL coordination |
 | `SafeGo` | Run local work with policy-controlled panic retries |
-| `InitSQLLease` | Initialize SQL coordination and create missing schema objects |
+| `SafeGoWithCtx` | Run local work with an additional task-specific context |
 | `StartUniqueSupervisor` | Run persistent work while this process owns its lease |
+| `StartUniqueSupervisorWithCtx` | Run unique work with an additional task-specific context |
 | `GetSupervisorStatuses` | Read current supervisor state from SQL |
 | `GetSupervisorLogs` | Read retained acquire and release history from SQL |
 | `Handle` | Stop, wait for, or observe managed work |
+| `Close` | Request cancellation of all managed work without waiting |
 | `Wait` | Wait for all active handles in this process |
 
 ## Install
@@ -35,14 +38,46 @@ go get github.com/LazyEasyDev/EasyRoutine
 import EasyRoutine "github.com/LazyEasyDev/EasyRoutine"
 ```
 
+## Package Lifetime
+
+Call `Initialize` once with an active application-lifetime context before
+starting any managed work, including the `WithCtx` variants. For an application
+using only local tasks:
+
+```go
+if err := EasyRoutine.Initialize(appCtx, nil); err != nil {
+	log.Fatal(err)
+}
+```
+
+To enable unique work, pass a `*SQLConfig` containing the database and dialect,
+as shown below. With a nil configuration, unique launch functions and SQL
+status/history queries return an error before starting work. A non-nil
+configuration requires a non-nil `DB` and a supported `Dialect`.
+
+SQL-backed initialization also enables local tasks. Choose one initialization
+mode at startup; a successful local-only initialization cannot later be
+upgraded to SQL.
+
+The package owns a child of `appCtx`. Canceling `appCtx`, letting its deadline
+expire, or calling `EasyRoutine.Close()` permanently cancels that child. This
+requests cancellation of all managed work and rejects future launches, even
+with an independent `WithCtx` context. The caller's context and database remain
+caller-owned; `Close` does not cancel that context or close that database.
+
+There is one package lifetime per process. Successful initialization cannot be
+repeated, even after cancellation, `Close`, and `Wait`. Neither `Close` nor
+`Wait` resets the package or replaces its database. Failed initialization
+publishes no package state and can be retried.
+
 ## Local Work
 
-`SafeGo` starts a goroutine and recovers task panics. The panic policy receives
-the recovered value, stack trace, and one-based failure count.
+`SafeGo` uses the initialized package context, starts a goroutine, and recovers
+task panics. The panic policy receives the recovered value, stack trace, and
+one-based failure count.
 
 ```go
 handle, err := EasyRoutine.SafeGo(
-	appCtx,
 	func(ctx context.Context) {
 		process(ctx)
 	},
@@ -69,19 +104,25 @@ defer handle.Stop()
 | `PanicDecision{Retry: true}` | Retry immediately |
 | `NoRetry()` or `PanicDecision{}` | Stop after recovery |
 
-The context, task, and panic policy must be non-nil, and the context must still
-be active. Invalid arguments return an error before a goroutine starts. A panic
-from the policy is contained and stops the task.
+The task and panic policy must be non-nil, and the initialized package context
+must still be active. Invalid arguments return an error before a goroutine
+starts. A panic from the policy is contained and stops the task.
+
+Use `SafeGoWithCtx(taskCtx, task, policy)` for a task-specific context. It keeps
+that context's values and deadlines and requests cancellation when either it or
+the package context is canceled. The supplied context must be non-nil and
+active. Canceling `taskCtx` affects this handle, not the package lifetime.
 
 Each retry receives a fresh child context. The failed attempt's context is
 canceled before the policy runs. A normal return or a stop decision finishes
-`SafeGo`. Parent cancellation and `Handle.Stop` stop further retries, but the
-handle cannot complete until the current task returns.
+`SafeGo`. Context cancellation, `Close`, and `Handle.Stop` stop further retries,
+but the handle cannot complete until the current task returns.
 
 ## Unique Work Across Processes
 
-Unique supervisors use the built-in SQL lease backend. Initialize it in
-each application process before starting supervisors or querying SQL state.
+Unique supervisors use the built-in SQL lease backend. Each application process
+must pass a SQL configuration to `Initialize` before starting supervisors or
+querying SQL state. This replaces local-only initialization; do not call both.
 
 ### Initialize SQL
 
@@ -103,18 +144,47 @@ if err != nil {
 }
 defer db.Close()
 
-if err := EasyRoutine.InitSQLLease(appCtx, db, EasyRoutine.SQLPostgreSQL); err != nil {
+if err := EasyRoutine.Initialize(appCtx, &EasyRoutine.SQLConfig{
+	DB:      db,
+	Dialect: EasyRoutine.SQLPostgreSQL,
+}); err != nil {
 	log.Fatal(err)
 }
+defer func() {
+	EasyRoutine.Close()
+	EasyRoutine.Wait()
+}()
 ```
 
-`InitSQLLease` validates its inputs, creates missing schema objects, and then
-registers the SQL backend. If schema setup fails, it returns an error without
-registering the backend, so initialization can be retried. Once initialization
-succeeds, subsequent calls with a non-nil context and database return nil without
-repeating schema setup or replacing the backend. The first successful database
-and dialect remain in use. Concurrent calls are serialized. Multiple processes
-may initialize against the same shared database during startup.
+The shutdown defer is registered last, so it runs before `defer db.Close()`.
+
+With a non-nil `SQLConfig`, `Initialize` validates its inputs, creates missing
+schema objects, and then registers the package lifetime and SQL backend. If
+configuration validation or schema setup fails, it returns an error without
+publishing package state, so initialization can be retried. Subsequent calls
+after successful initialization return an error. Concurrent calls are
+serialized. Multiple processes may initialize against the same shared database
+during startup.
+
+The database remains caller-owned. Keep it open until `Close` followed by
+`Wait` has allowed managed work and lease cleanup to finish. Then call
+`db.Close()`. Neither EasyRoutine operation closes the database.
+
+Closing only the database is not package shutdown. At the next failed lease
+renewal, including its retry, the supervisor requests cancellation of the
+running task and waits for it to return. Once renewal failure is observed,
+`repeatAfter` does not restart the task, and lease acquisitions against the
+closed database fail. Before that failure is observed, a repeat delay can still
+start another attempt. The supervisor remains registered and keeps retrying
+acquisition until its lifetime is canceled by `Close`, context cancellation, or
+`handle.Stop()`. Calling `Wait` alone does not stop it.
+
+Lease SQL errors are handled as failed lease operations, not task panics. SQL
+queries and the task's own database calls can still return errors. If a task
+ignores cancellation, it may continue after its lease expires and overlap
+another owner. A closed `*sql.DB` cannot be reopened or replaced through another
+successful initialization. A temporary database outage without closing the
+pool is different: supervisors may reacquire their leases when SQL recovers.
 
 The database user must be allowed to execute the schema statements. Startup
 creates missing objects but does not alter or validate existing table schemas.
@@ -148,7 +218,6 @@ lease operation, only the current owner runs the task.
 
 ```go
 handle, err := EasyRoutine.StartUniqueSupervisor(
-	appCtx,
 	"queue-consumer",
 	func(ctx context.Context) {
 		consumeQueue(ctx)
@@ -164,9 +233,16 @@ if err != nil {
 defer handle.Stop()
 ```
 
-The context, task, and panic handler are required. The repeat delay must not be
-negative; zero repeats immediately. Invalid arguments return an error before a
-goroutine starts. `InitSQLLease` must succeed before this call.
+The task and panic handler are required. The repeat delay must not be negative;
+zero repeats immediately. Invalid arguments return an error before a goroutine
+starts. `Initialize` must succeed with a SQL database before this call.
+
+For a task-specific context, use
+`StartUniqueSupervisorWithCtx(taskCtx, name, task, onPanic, repeatAfter)`.
+The supplied context must be non-nil and active. As with `SafeGoWithCtx`, the
+supervisor requests shutdown when either the supplied or package context is
+canceled. Completion still waits for the current task to return and lease
+cleanup to finish.
 
 A supervisor name must:
 
@@ -178,9 +254,13 @@ Names are exact identifiers. Case and UTF-8 byte representation are preserved,
 so every process must use the same name for the same task.
 
 After a normal return, the supervisor retains its lease and starts the task
-again after the repeat delay. Heartbeats continue during this wait. The panic
-handler is notification-only and cannot change recovery timing. It runs after
-the first panic release attempt; a panic from the handler is contained.
+again after the repeat delay. The delay starts only after the task returns;
+it does not launch overlapping attempts within one supervisor. A task that
+never returns never reaches this delay. `SafeGo`, in contrast, finishes after a
+normal return and retries only according to its panic policy. Heartbeats
+continue during execution and the repeat wait. The panic handler is
+notification-only and cannot change recovery timing. It runs after the first
+panic release attempt; a panic from the handler is contained.
 
 ### Lifecycle
 
@@ -193,13 +273,17 @@ flowchart TD
     D --> C
     C -->|renewal not confirmed| E[Cancel task and wait for cleanup]
     E --> F[Attempt release once]
+	D -->|renewal not confirmed| F
     F --> B
     C -->|task panic| G[Stop renewal and attempt release]
     G --> H[Notify panic handler]
     H --> I[Wait through 300-second cooldown]
-    I --> A
-    C -->|Stop or parent cancellation| J[Cancel task and wait for cleanup]
+	I --> A
+	C -->|Close, Stop, or context cancellation| J[Cancel task and wait for cleanup]
     J --> K[Stop renewal, attempt release, finish]
+	D -->|Close, Stop, or context cancellation| K
+	B -->|Close, Stop, or context cancellation| L[Finish]
+	I -->|Close, Stop, or context cancellation| L
 ```
 
 When renewal returns `false`, the supervisor can no longer confirm ownership.
@@ -211,11 +295,16 @@ On panic, renewal stops before the first release attempt. If release fails, the
 supervisor retries it on the heartbeat cadence during the cooldown. This
 process does not compete for the lease again until the full cooldown ends.
 
-On `Stop` or parent cancellation, the heartbeat remains active while the task
-performs cooperative cleanup. After the task returns, the supervisor stops the
-heartbeat and makes one bounded release attempt. The handle completes even if
-that release fails. If the task never returns, cleanup cannot finish and the
-heartbeat continues while SQL renewal succeeds.
+On `Close`, `Stop`, or context cancellation, the heartbeat remains active while
+the task performs cooperative cleanup. After the task returns, the supervisor
+stops the heartbeat and makes one release attempt with a 30-second context
+timeout. The handle completes even if that release fails. If the task never
+returns, cleanup cannot finish and the heartbeat continues while SQL renewal
+succeeds.
+
+Shutdown also interrupts acquisition retry waits, the repeat delay, and the
+panic cooldown. A task does not need to check its context if it will return
+naturally, but ignoring cancellation delays shutdown until that return.
 
 Fixed timings:
 
@@ -223,8 +312,11 @@ Fixed timings:
 | --- | ---: | --- |
 | Lease TTL | 180 seconds | Ownership lifetime without renewal |
 | Heartbeat | 30 seconds | Acquisition, renewal, and panic-release retry cadence |
-| Release timeout | 30 seconds | Maximum duration of one release attempt |
+| Release timeout | 30 seconds | Context timeout for one release attempt |
 | Panic cooldown | 300 seconds | Delay before the panicked process competes again |
+
+The release timeout bounds cleanup only when the database driver honors
+context cancellation; EasyRoutine cannot forcibly terminate a SQL call either.
 
 SQL renewal retries once after a 10-second, context-aware delay when execution
 returns an error. A successful statement affecting zero rows is not retried.
@@ -232,34 +324,59 @@ For MySQL-family drivers, which normally report changed rather than matched
 rows, a zero-change renewal performs an owner-and-expiration read to confirm the
 lease. On other dialects, zero affected rows means ownership was not confirmed.
 
-## Handles and Cancellation
+## Handles and Shutdown
 
-Both launch functions return `*Handle`.
+All launch functions, including the `WithCtx` variants, return `*Handle`.
+To stop and wait for one handle:
 
 ```go
-handle.Stop()     // request cooperative cancellation
-<-handle.Done()  // wait with a channel
-handle.Wait()    // or wait directly
-
-cancelApp()
-EasyRoutine.Wait() // wait for every active SafeGo and unique supervisor
+handle.Stop()
+handle.Wait()
 ```
+
+`handle.Stop()` requests cancellation of only that handle; it does not cancel
+the package lifetime or caller's context. `handle.Wait()` waits for that
+handle's work and cleanup. Alternatively, wait on `<-handle.Done()`.
+
+For package shutdown, request cancellation first, wait second, and close the
+caller-owned SQL database last:
+
+```go
+EasyRoutine.Close()
+EasyRoutine.Wait()
+if err := db.Close(); err != nil {
+	log.Printf("close database: %v", err)
+}
+```
+
+For local-only applications, omit `db.Close()`. Canceling the application
+context also requests package shutdown, but the application must still wait
+before closing the database.
+
+`Close` is idempotent, does not wait for callbacks or cleanup, and is a no-op
+before initialization. After it returns, new launches return an error without
+starting a goroutine. This includes launches with an independent `WithCtx`
+context. It does not reset the package for another `Initialize` call.
 
 `Done` only returns a completion channel; it does not stop work. `Wait` and
 `Done` complete after managed work and cleanup finish. Calling `Stop` more than
-once is safe. Tasks must observe `ctx.Done()` and pass their supplied context to
-blocking operations because EasyRoutine cannot force a function to return.
+once is safe. Cancellation is cooperative: EasyRoutine cannot forcibly end a
+task, panic policy, or panic handler. Tasks should observe `ctx.Done()` and pass
+their supplied context to blocking operations. A callback that ignores
+cancellation but eventually returns allows shutdown to finish; a callback that
+never returns keeps its handle and package-level `Wait` blocked.
 
 The package-level `EasyRoutine.Wait()` tracks every handle successfully started
-by `SafeGo` and `StartUniqueSupervisor`. It includes work started while it is
-already blocked and returns at the first synchronized instant when no tracked
-handles remain. Work started after that instant requires another call to
-`EasyRoutine.Wait()`. Completed handles are removed from the internal tracking
-set.
+by the local and unique launch functions, including `WithCtx` variants. It
+includes work started while it is already blocked and returns at the first
+synchronized instant when no tracked handles remain. Without package shutdown,
+work started after that instant requires another call to `EasyRoutine.Wait()`.
+Completed handles are removed from the internal tracking set.
 
-Package-level `Wait` does not stop or cancel work. Cancel the shared application
-context or stop persistent supervisors before calling it during shutdown. Do
-not call it from a managed task, panic policy, or panic handler because that
+Package-level `Wait` does not stop or cancel work. Call `Close`, cancel the
+application context, or stop persistent supervisors before waiting during
+shutdown. Merely calling `Wait` can block indefinitely on an active supervisor.
+Do not call it from a managed task, panic policy, or panic handler because that
 would wait for the caller's own handle to complete.
 
 Task functions, panic policies, and panic handlers must not call
@@ -270,11 +387,17 @@ instead.
 
 ## Status and History
 
-`GetSupervisorStatuses` and `GetSupervisorLogs` require successful SQL initialization. With no
-names they return all records. Supplied names use the supervisor-name validation
-rules. Duplicate filters are removed and large filters are queried in bounded
-batches. An all-history `GetSupervisorLogs` call first discovers stored routine IDs, then
-uses the same bounded batches and groups the results by exact routine name.
+`GetSupervisorStatuses` and `GetSupervisorLogs` require successful `Initialize`
+with a SQL database. Their context arguments remain per-query contexts; queries
+can still run after `Close` if that context and the database remain active.
+These calls are not managed handles and are not tracked by `Wait`; callers must
+finish them separately before closing the database.
+
+With no names they return all records. Supplied names use the supervisor-name
+validation rules. Duplicate filters are removed and large filters are queried
+in bounded batches. An all-history `GetSupervisorLogs` call first discovers
+stored routine IDs, then uses the same bounded batches and groups the results
+by exact routine name.
 
 ```go
 statuses, err := EasyRoutine.GetSupervisorStatuses(appCtx)
