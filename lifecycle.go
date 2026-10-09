@@ -86,9 +86,13 @@ func Close() {
 // have completed, including WithCtx variants. Operations started before Wait
 // observes no active handles are included, including operations started while
 // Wait is blocked.
+// Wait synchronizes with in-flight launch registrations before waiting.
 // Wait does not stop or cancel managed work; call Close to request shutdown.
 func Wait() {
-	activeHandles.wait()
+	lifecycleMu.Lock()
+	registry := activeHandles
+	lifecycleMu.Unlock()
+	registry.wait()
 }
 
 func initializedContext() (context.Context, error) {
