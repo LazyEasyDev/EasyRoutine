@@ -126,10 +126,8 @@ querying SQL state. This replaces local-only initialization; do not call both.
 
 ### Initialize SQL
 
-The application opens and imports its own `database/sql` driver. Normal
-EasyRoutine builds do not import or link a database driver; the repository's
-`integration`-tagged tests register their test drivers from `go.mod`. This
-example uses PostgreSQL with pgx:
+The application opens and imports its own `database/sql` driver. EasyRoutine
+does not import or link a database driver. This example uses PostgreSQL with pgx:
 
 ```go
 import (
@@ -165,6 +163,12 @@ publishing package state, so initialization can be retried. Subsequent calls
 after successful initialization return an error. Concurrent calls are
 serialized. Multiple processes may initialize against the same shared database
 during startup.
+
+Schema setup has one 30-second context timeout covering all schema statements.
+Each statement is attempted once. On failure, the caller decides whether to retry
+initialization. An earlier deadline or cancellation on the supplied context takes
+precedence. This timeout does not shorten the package lifetime and bounds schema
+setup only when the database driver honors context cancellation.
 
 The database remains caller-owned. Keep it open until `Close` followed by
 `Wait` has allowed managed work and lease cleanup to finish. Then call
@@ -493,30 +497,6 @@ schedule heartbeats, delays, and timeouts.
 ClickHouse is intentionally unsupported because its normal mutation model does
 not provide the uniqueness-enforcing row operations required by this lease
 protocol.
-
-## Real Database Integration Tests
-
-The build-tagged integration suite executes the schema, ownership, renewal,
-history, query, supervisor, and process-contention paths against a real SQL
-backend. Set the dialect and driver DSN, then run:
-
-```sh
-EASYROUTINE_TEST_DIALECT=postgresql \
-EASYROUTINE_TEST_DSN='postgres://user:password@localhost/database?sslmode=disable' \
-go test -tags=integration -count=1 -timeout=20m -run '^TestRealSQLBackend$' ./...
-```
-
-Supported values are `postgresql`, `mysql`, `mariadb`, `tidb`, `sqlite`,
-`sqlserver`, `gaussdb`, and `oracle`. The suite defaults to 128 simultaneous
-lease contenders over six rounds, 32 competing supervisors, and 12 independent
-worker processes. Larger stress runs can set `EASYROUTINE_TEST_CONTENDERS`,
-`EASYROUTINE_TEST_CONTENTION_ROUNDS`, `EASYROUTINE_TEST_SUPERVISORS`, and
-`EASYROUTINE_TEST_PROCESSES` to positive integers. Distinct-name parallelism is
-controlled by `EASYROUTINE_TEST_PARALLEL_NAMES` and
-`EASYROUTINE_TEST_PARALLEL_REPLICAS`; these default to 32 names with three
-competing supervisors per name. The name count must be at least four and the
-replica count at least two. This workload also includes names differing only by
-case or Unicode normalization.
 
 ## Distributed Safety
 

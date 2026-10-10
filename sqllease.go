@@ -11,9 +11,8 @@ import (
 )
 
 const (
-	sqlRenewRetryDelay  = 10 * time.Second
-	sqlSchemaRetryDelay = 200 * time.Millisecond
-	sqlSchemaMaxRetries = 4
+	sqlRenewRetryDelay = 10 * time.Second
+	sqlSchemaTimeout   = 30 * time.Second
 )
 
 // SQLDialect identifies a database compatibility target.
@@ -90,46 +89,21 @@ func (s *sqlLease) ensureSchema(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return errors.New("SQL lease is not initialized")
 	}
-	if err := s.ensureSchemaObject(ctx, s.statements.create); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, sqlSchemaTimeout)
+	defer cancel()
+
+	if _, err := s.db.ExecContext(ctx, s.statements.create); err != nil {
 		return fmt.Errorf("create easy_rountine_unique table: %w", err)
 	}
-	if err := s.ensureSchemaObject(ctx, s.logs.create); err != nil {
+	if _, err := s.db.ExecContext(ctx, s.logs.create); err != nil {
 		return fmt.Errorf("create easy_routine_unique_log table: %w", err)
 	}
 	if s.logs.createIndex != "" {
-		if err := s.ensureSchemaObject(ctx, s.logs.createIndex); err != nil {
+		if _, err := s.db.ExecContext(ctx, s.logs.createIndex); err != nil {
 			return fmt.Errorf("create easy_routine_unique_log routine ID index: %w", err)
 		}
 	}
 	return nil
-}
-
-func (s *sqlLease) ensureSchemaObject(ctx context.Context, statement string) error {
-	for attempt := 0; ; attempt++ {
-		_, err := s.db.ExecContext(ctx, statement)
-		if err == nil {
-			return nil
-		}
-		if attempt >= sqlSchemaMaxRetries || !retryableSchemaRace(err) {
-			return err
-		}
-		if !waitForDelay(ctx, sqlSchemaRetryDelay) {
-			return ctx.Err()
-		}
-	}
-}
-
-func retryableSchemaRace(err error) bool {
-	var sqlState interface{ SQLState() string }
-	if !errors.As(err, &sqlState) {
-		return false
-	}
-	switch sqlState.SQLState() {
-	case "23505", "42P07", "42710":
-		return true
-	default:
-		return false
-	}
 }
 
 func (s *sqlLease) acquireState(ctx context.Context, state leaseState, ttlArgument int64) bool {
