@@ -3,7 +3,6 @@ package EasyRoutine
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -14,8 +13,6 @@ const sqlLogTimeout = 10 * time.Second
 
 // Keep each filter below Oracle's IN-list and older SQLite variable limits.
 const sqlNameFilterBatchSize = 900
-
-type sqlQueryContext func(context.Context, string, ...any) (*sql.Rows, error)
 
 type sqlLogStatements struct {
 	create      string
@@ -88,10 +85,7 @@ func (s *sqlLease) validateAction(ctx context.Context, action LeaseAction, state
 	}
 	switch action {
 	case LeaseAcquire, LeaseRenew:
-		if s.statements.ttlArgument == nil {
-			return 0, false
-		}
-		return s.statements.ttlArgument(state.TTL)
+		return ttlSeconds(state.TTL)
 	case LeaseRelease:
 		return 0, true
 	default:

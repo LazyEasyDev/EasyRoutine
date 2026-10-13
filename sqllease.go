@@ -32,17 +32,11 @@ const (
 // sqlLease coordinates unique supervisors and stores current state and
 // lifecycle history in SQL.
 type sqlLease struct {
-	db              sqlLeaseExecer
+	db              *sql.DB
 	statements      sqlLeaseStatements
 	logs            sqlLogStatements
 	supervisors     sqlSupervisorStatements
-	query           sqlQueryContext
-	begin           func(context.Context, *sql.TxOptions) (*sql.Tx, error)
 	renewRetryDelay time.Duration
-}
-
-type sqlLeaseExecer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
 type sqlLeaseStatements struct {
@@ -52,10 +46,9 @@ type sqlLeaseStatements struct {
 	renew           string
 	confirmRenew    string
 	release         string
-	ttlArgument     func(time.Duration) (int64, bool)
 }
 
-func newSQLLease(db sqlLeaseExecer, dialect SQLDialect) (*sqlLease, error) {
+func newSQLLease(db *sql.DB, dialect SQLDialect) (*sqlLease, error) {
 	statements, err := statementsForSQLDialect(dialect)
 	if err != nil {
 		return nil, err
@@ -68,24 +61,13 @@ func newSQLLease(db sqlLeaseExecer, dialect SQLDialect) (*sqlLease, error) {
 	if err != nil {
 		return nil, err
 	}
-	backend := &sqlLease{
+	return &sqlLease{
 		db:              db,
 		statements:      statements,
 		logs:            logs,
 		supervisors:     supervisors,
 		renewRetryDelay: sqlRenewRetryDelay,
-	}
-	if queryer, ok := db.(interface {
-		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-	}); ok {
-		backend.query = queryer.QueryContext
-	}
-	if beginner, ok := db.(interface {
-		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
-	}); ok {
-		backend.begin = beginner.BeginTx
-	}
-	return backend, nil
+	}, nil
 }
 
 func (s *sqlLease) ensureSchema(ctx context.Context) error {
@@ -161,10 +143,10 @@ func (s *sqlLease) confirmRenewState(ctx context.Context, state leaseState) bool
 	// MySQL-family drivers normally report changed rather than matched rows. A
 	// same-second renewal can therefore return zero even though its owner guard
 	// matched; confirm that the lease written by that update is still live.
-	if s.statements.confirmRenew == "" || s.query == nil {
+	if s.statements.confirmRenew == "" {
 		return false
 	}
-	rows, err := s.query(ctx, s.statements.confirmRenew, routineID(state.Name), state.Owner)
+	rows, err := s.db.QueryContext(ctx, s.statements.confirmRenew, routineID(state.Name), state.Owner)
 	if err != nil {
 		return false
 	}
@@ -263,7 +245,6 @@ SET "expires_at" = ` + postgreSQLCurrentSeconds + `,
 	"log" = $4,
 	"updated_at" = ` + postgreSQLCurrentSeconds + `
 WHERE "routine_id" = $5 AND "owner" = $6`,
-	ttlArgument: ttlSeconds,
 }
 
 const mySQLCurrentSeconds = "UNIX_TIMESTAMP()"
@@ -309,7 +290,6 @@ SET ` + "`expires_at`" + ` = ` + mySQLCurrentSeconds + `,
 	` + "`log`" + ` = ?,
 	` + "`updated_at`" + ` = ` + mySQLCurrentSeconds + `
 WHERE ` + "`routine_id`" + ` = ? AND ` + "`owner`" + ` = ?`,
-	ttlArgument: ttlSeconds,
 }
 
 const sqliteCurrentSeconds = "CAST(strftime('%s', 'now') AS INTEGER)"
@@ -354,7 +334,6 @@ SET "expires_at" = ` + sqliteCurrentSeconds + `,
 	"log" = ?,
 	"updated_at" = ` + sqliteCurrentSeconds + `
 WHERE "routine_id" = ? AND "owner" = ?`,
-	ttlArgument: ttlSeconds,
 }
 
 const sqlServerCurrentSeconds = "DATEDIFF_BIG(SECOND, CAST('1970-01-01T00:00:00' AS DATETIME2), SYSUTCDATETIME())"
@@ -408,7 +387,6 @@ SET [expires_at] = ` + sqlServerCurrentSeconds + `,
 	[log] = @p4,
 	[updated_at] = ` + sqlServerCurrentSeconds + `
 WHERE [routine_id] = @p5 AND [owner] = @p6`,
-	ttlArgument: ttlSeconds,
 }
 
 const oracleCurrentSeconds = "FLOOR((CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE) - DATE '1970-01-01') * 86400)"
@@ -456,5 +434,4 @@ SET "expires_at" = ` + oracleCurrentSeconds + `,
 	"log" = :4,
 	"updated_at" = ` + oracleCurrentSeconds + `
 WHERE "routine_id" = :5 AND "owner" = :6`,
-	ttlArgument: ttlSeconds,
 }

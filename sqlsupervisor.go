@@ -21,21 +21,26 @@ type sqlSupervisorStatements struct {
 }
 
 func (s *sqlLease) ListSupervisors(ctx context.Context, names ...string) ([]Supervisor, error) {
-	if s == nil || s.query == nil {
+	if s == nil || s.db == nil {
 		return nil, errors.New("SQL lease queries are not initialized")
 	}
 	items := make([]Supervisor, 0)
 	routineIDs := uniqueRoutineIDs(names)
 	if len(routineIDs) == 0 {
-		return s.listSupervisorBatch(ctx, nil)
-	}
-	for start := 0; start < len(routineIDs); start += sqlNameFilterBatchSize {
-		end := min(start+sqlNameFilterBatchSize, len(routineIDs))
-		batch, err := s.listSupervisorBatch(ctx, routineIDs[start:end])
+		var err error
+		items, err = s.listSupervisorBatch(ctx, nil)
 		if err != nil {
 			return nil, err
 		}
-		items = append(items, batch...)
+	} else {
+		for start := 0; start < len(routineIDs); start += sqlNameFilterBatchSize {
+			end := min(start+sqlNameFilterBatchSize, len(routineIDs))
+			batch, err := s.listSupervisorBatch(ctx, routineIDs[start:end])
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, batch...)
+		}
 	}
 	sortSupervisors(items)
 	return items, nil
@@ -57,7 +62,7 @@ func (s *sqlLease) listSupervisorBatch(ctx context.Context, routineIDs []string)
 	for index := range items {
 		routinesByID[items[index].RoutineID] = &items[index]
 	}
-	rows, err := s.query(ctx, countsQuery+s.supervisors.groupCounts, args...)
+	rows, err := s.db.QueryContext(ctx, countsQuery+s.supervisors.groupCounts, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query supervisor log counts: %w", err)
 	}
@@ -93,12 +98,11 @@ func (s *sqlLease) listSupervisorBatch(ctx context.Context, routineIDs []string)
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate supervisor log counts: %w", err)
 	}
-	sortSupervisors(items)
 	return items, nil
 }
 
 func (s *sqlLease) querySupervisors(ctx context.Context, query string, args []any) ([]Supervisor, error) {
-	rows, err := s.query(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query supervisors: %w", err)
 	}
@@ -132,10 +136,10 @@ func sortSupervisors(items []Supervisor) {
 }
 
 func (s *sqlLease) GetSupervisorHistory(ctx context.Context, routineID string) ([]SupervisorLog, error) {
-	if s == nil || s.query == nil {
+	if s == nil || s.db == nil {
 		return nil, errors.New("SQL lease queries are not initialized")
 	}
-	rows, err := s.query(ctx, s.supervisors.history, routineID)
+	rows, err := s.db.QueryContext(ctx, s.supervisors.history, routineID)
 	if err != nil {
 		return nil, fmt.Errorf("query supervisor history: %w", err)
 	}
@@ -157,10 +161,10 @@ func (s *sqlLease) GetSupervisorHistory(ctx context.Context, routineID string) (
 }
 
 func (s *sqlLease) DeleteSupervisorRecords(ctx context.Context, name string) error {
-	if s == nil || s.begin == nil {
+	if s == nil || s.db == nil {
 		return errors.New("SQL lease transactions are not initialized")
 	}
-	transaction, err := s.begin(ctx, nil)
+	transaction, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin supervisor deletion: %w", err)
 	}
