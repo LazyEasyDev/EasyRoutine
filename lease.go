@@ -47,16 +47,16 @@ type leaseState struct {
 
 // SupervisorLog is a durable lifecycle event recorded by the SQL backend.
 type SupervisorLog struct {
-	ID        string
-	RoutineID string
-	Name      string
-	Owner     string
-	Action    LeaseAction
-	Status    RoutineStatus
+	ID        string        `json:"id"`
+	RoutineID string        `json:"routine_id"`
+	Name      string        `json:"name"`
+	Owner     string        `json:"owner"`
+	Action    LeaseAction   `json:"action"`
+	Status    RoutineStatus `json:"status"`
 	// Log starts with the server tag and contains panic details when applicable.
-	Log string
+	Log string `json:"log"`
 	// CreatedAt is Unix time in seconds assigned by the provider's storage clock.
-	CreatedAt int64
+	CreatedAt int64 `json:"created_at"`
 }
 
 func validateRoutineName(name string) error {

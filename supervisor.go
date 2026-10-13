@@ -13,28 +13,28 @@ var ErrSupervisorRegistered = errors.New("name is already registered in this pro
 
 // SupervisorLogCounts describes retained lifecycle history, not lifetime totals.
 type SupervisorLogCounts struct {
-	NotStarted int64
-	Running    int64
-	Done       int64
-	Panic      int64
-	Other      int64
+	NotStarted int64 `json:"not_started"`
+	Running    int64 `json:"running"`
+	Done       int64 `json:"done"`
+	Panic      int64 `json:"panic"`
+	Other      int64 `json:"other"`
 }
 
 // Supervisor is a lightweight stored state with database-clock lease activity.
 // Owner is an acquisition token. Timestamp fields are Unix seconds.
 type Supervisor struct {
-	RoutineID     string
-	Name          string
-	Owner         string
-	Status        RoutineStatus
-	SuccessCount  int64
-	FailureCount  int64
-	ExpiresAt     int64
-	UpdatedAt     int64
-	LeaseActive   bool
-	RetainedLogs  int64
-	LatestPanicAt int64
-	LogCounts     SupervisorLogCounts
+	RoutineID     string              `json:"routine_id"`
+	Name          string              `json:"name"`
+	Owner         string              `json:"owner"`
+	Status        RoutineStatus       `json:"status"`
+	SuccessCount  int64               `json:"success_count"`
+	FailureCount  int64               `json:"failure_count"`
+	ExpiresAt     int64               `json:"expires_at"`
+	UpdatedAt     int64               `json:"updated_at"`
+	LeaseActive   bool                `json:"lease_active"`
+	RetainedLogs  int64               `json:"retained_logs"`
+	LatestPanicAt int64               `json:"latest_panic_at"`
+	LogCounts     SupervisorLogCounts `json:"log_counts"`
 }
 
 // ListSupervisors returns stored states and retained log counts without log text.
