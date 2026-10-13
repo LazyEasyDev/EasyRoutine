@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
-	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 )
@@ -20,14 +18,10 @@ const sqlNameFilterBatchSize = 900
 type sqlQueryContext func(context.Context, string, ...any) (*sql.Rows, error)
 
 type sqlLogStatements struct {
-	create           string
-	createIndex      string
-	insert           string
-	prune            string
-	selectRoutineIDs string
-	selectBase       string
-	routineIDColumn  string
-	bindVariable     func(int) string
+	create      string
+	createIndex string
+	insert      string
+	prune       string
 }
 
 // Action atomically applies ownership and current state. Acquire and release
@@ -51,188 +45,6 @@ func (s *sqlLease) Action(ctx context.Context, action LeaseAction, state leaseSt
 		s.recordLog(ctx, action, state)
 	}
 	return applied
-}
-
-// GetSupervisorLogs returns retained records grouped by exact routine name. Each history
-// is ordered oldest first. With no names it returns logs for every task.
-func (s *sqlLease) GetSupervisorLogs(ctx context.Context, names ...string) (SupervisorHistory, error) {
-	if ctx == nil {
-		return nil, errors.New("context is required")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if s == nil || s.db == nil || s.query == nil {
-		return nil, errors.New("SQL lease is not initialized")
-	}
-	routineIDs := uniqueRoutineIDs(names)
-	if len(names) == 0 {
-		var err error
-		routineIDs, err = s.queryLogRoutineIDs(ctx)
-		if err != nil {
-			return nil, err
-		}
-	}
-	history := make(SupervisorHistory)
-	if len(routineIDs) == 0 {
-		return history, nil
-	}
-
-	for start := 0; start < len(routineIDs); start += sqlNameFilterBatchSize {
-		end := min(start+sqlNameFilterBatchSize, len(routineIDs))
-		query, args := filteredSQLQuery(
-			s.logs.selectBase,
-			s.logs.routineIDColumn,
-			s.logs.bindVariable,
-			routineIDs[start:end],
-		)
-		batch, err := s.queryLogs(ctx, query, args)
-		if err != nil {
-			return nil, err
-		}
-		for name, logs := range batch {
-			history[name] = append(history[name], logs...)
-		}
-	}
-	for name := range history {
-		logs := history[name]
-		sort.SliceStable(logs, func(left, right int) bool {
-			return logs[left].CreatedAt < logs[right].CreatedAt
-		})
-	}
-	return history, nil
-}
-
-func (s *sqlLease) queryLogRoutineIDs(ctx context.Context) ([]string, error) {
-	rows, err := s.query(ctx, s.logs.selectRoutineIDs)
-	if err != nil {
-		return nil, fmt.Errorf("query supervisor log routine IDs: %w", err)
-	}
-	defer rows.Close()
-
-	routineIDs := make([]string, 0)
-	for rows.Next() {
-		var routineID string
-		if err := rows.Scan(&routineID); err != nil {
-			return nil, fmt.Errorf("scan supervisor log routine ID: %w", err)
-		}
-		routineIDs = append(routineIDs, routineID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate supervisor log routine IDs: %w", err)
-	}
-	return routineIDs, nil
-}
-
-func (s *sqlLease) queryLogs(ctx context.Context, query string, args []any) (SupervisorHistory, error) {
-	rows, err := s.query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query supervisor logs: %w", err)
-	}
-	defer rows.Close()
-
-	history := make(SupervisorHistory)
-	for rows.Next() {
-		var (
-			log     SupervisorLog
-			action  string
-			status  string
-			logText sql.NullString
-		)
-		if err := rows.Scan(
-			&log.ID,
-			&log.Name,
-			&log.Owner,
-			&action,
-			&status,
-			&logText,
-			&log.CreatedAt,
-		); err != nil {
-			return nil, fmt.Errorf("scan supervisor log: %w", err)
-		}
-		log.Action = LeaseAction(action)
-		log.Status = RoutineStatus(status)
-		log.Log = logText.String
-		history[log.Name] = append(history[log.Name], log)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate supervisor logs: %w", err)
-	}
-	return history, nil
-}
-
-// GetSupervisorStatuses returns one current state per exact routine name. With no names it
-// returns every current state; otherwise it filters by the supplied names.
-func (s *sqlLease) GetSupervisorStatuses(ctx context.Context, names ...string) (SupervisorStatuses, error) {
-	if ctx == nil {
-		return nil, errors.New("context is required")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if s == nil || s.db == nil || s.query == nil {
-		return nil, errors.New("SQL lease is not initialized")
-	}
-	routineIDs := uniqueRoutineIDs(names)
-
-	if len(routineIDs) == 0 {
-		return s.queryStatuses(ctx, s.statements.selectBase, nil)
-	}
-
-	statuses := make(SupervisorStatuses, len(routineIDs))
-	for start := 0; start < len(routineIDs); start += sqlNameFilterBatchSize {
-		end := min(start+sqlNameFilterBatchSize, len(routineIDs))
-		query, args := filteredSQLQuery(
-			s.statements.selectBase,
-			s.statements.routineIDColumn,
-			s.statements.bindVariable,
-			routineIDs[start:end],
-		)
-		batch, err := s.queryStatuses(ctx, query, args)
-		if err != nil {
-			return nil, err
-		}
-		for name, status := range batch {
-			statuses[name] = status
-		}
-	}
-	return statuses, nil
-}
-
-func (s *sqlLease) queryStatuses(ctx context.Context, query string, args []any) (SupervisorStatuses, error) {
-	rows, err := s.query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query supervisor statuses: %w", err)
-	}
-	defer rows.Close()
-
-	statuses := make(SupervisorStatuses)
-	for rows.Next() {
-		var (
-			status     SupervisorStatus
-			statusName string
-			logText    sql.NullString
-		)
-		if err := rows.Scan(
-			&status.Name,
-			&status.Owner,
-			&statusName,
-			&status.SuccessCount,
-			&status.FailureCount,
-			&logText,
-			&status.ExpiresAt,
-			&status.UpdatedAt,
-		); err != nil {
-			return nil, fmt.Errorf("scan supervisor status: %w", err)
-		}
-		status.Status = RoutineStatus(statusName)
-		status.Log = logText.String
-		statuses[status.Name] = status
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate supervisor statuses: %w", err)
-	}
-	return statuses, nil
 }
 
 func uniqueRoutineIDs(names []string) []string {
@@ -365,10 +177,6 @@ WHERE "id" IN (
     ) AS "ranked"
 		WHERE "row_number" > %d
 	)`, retainedLogsPerRoutineID),
-	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "easy_routine_unique_log"`,
-	selectBase:       `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "easy_routine_unique_log"`,
-	routineIDColumn:  `"routine_id"`,
-	bindVariable:     dollarVariable,
 }
 
 var mySQLLogStatements = sqlLogStatements{
@@ -394,10 +202,6 @@ WHERE `+"`id`"+` IN (
     ) AS `+"`ranked`"+`
 		WHERE `+"`row_number`"+` > %d
 	)`, retainedLogsPerRoutineID),
-	selectRoutineIDs: `SELECT DISTINCT ` + "`routine_id`" + ` FROM ` + "`easy_routine_unique_log`",
-	selectBase:       `SELECT ` + "`id`" + `, ` + "`name`" + `, ` + "`owner`" + `, ` + "`action`" + `, ` + "`status`" + `, ` + "`log`" + `, ` + "`created_at`" + ` FROM ` + "`easy_routine_unique_log`",
-	routineIDColumn:  "`routine_id`",
-	bindVariable:     questionVariable,
 }
 
 var sqliteLogStatements = sqlLogStatements{
@@ -423,10 +227,6 @@ WHERE "id" IN (
     ) AS "ranked"
 		WHERE "row_number" > %d
 	)`, retainedLogsPerRoutineID),
-	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "easy_routine_unique_log"`,
-	selectBase:       `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "easy_routine_unique_log"`,
-	routineIDColumn:  `"routine_id"`,
-	bindVariable:     questionVariable,
 }
 
 var sqlServerLogStatements = sqlLogStatements{
@@ -474,10 +274,6 @@ WHERE [id] IN (
     ) AS [ranked]
 		WHERE [row_number] > %d
 	)`, retainedLogsPerRoutineID),
-	selectRoutineIDs: `SELECT DISTINCT [routine_id] FROM [easy_routine_unique_log]`,
-	selectBase:       `SELECT [id], [name], [owner], [action], [status], [log], [created_at] FROM [easy_routine_unique_log]`,
-	routineIDColumn:  `[routine_id]`,
-	bindVariable:     sqlServerVariable,
 }
 
 var oracleLogStatements = sqlLogStatements{
@@ -527,8 +323,4 @@ WHERE "id" IN (
     )
 		WHERE "row_number" > %d
 	)`, retainedLogsPerRoutineID),
-	selectRoutineIDs: `SELECT DISTINCT "routine_id" FROM "easy_routine_unique_log"`,
-	selectBase:       `SELECT "id", "name", "owner", "action", "status", "log", "created_at" FROM "easy_routine_unique_log"`,
-	routineIDColumn:  `"routine_id"`,
-	bindVariable:     oracleVariable,
 }

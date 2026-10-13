@@ -27,8 +27,9 @@ type leaseTiming struct {
 }
 
 type coordinator struct {
-	backend leaseProvider
-	timing  leaseTiming
+	backend         leaseProvider
+	timing          leaseTiming
+	supervisorNames sync.Map
 }
 
 type taskAttemptResult struct {
@@ -131,6 +132,7 @@ type SupervisorPanicHandler func(Panic)
 // It uses the initialized package context and stops on cancellation, Close, or Stop.
 // The task and panic handler are required. A negative repeat delay
 // is invalid. Invalid arguments are returned before a goroutine is started.
+// A name already registered in this process returns ErrSupervisorRegistered.
 // The task and panic handler must not call runtime.Goexit; if either does,
 // supervision stops without treating Goexit as a panic.
 // Initialize must succeed with a SQL database before StartUniqueSupervisor.
@@ -178,9 +180,17 @@ func startUniqueSupervisor(ctx context.Context, name string, run func(context.Co
 }
 
 func (c *coordinator) startUniqueSupervisor(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) (*Handle, error) {
-	return startManagedHandle(ctx, func(ctx context.Context) {
+	if _, exists := c.supervisorNames.LoadOrStore(name, struct{}{}); exists {
+		return nil, fmt.Errorf("supervisor %q: %w", name, ErrSupervisorRegistered)
+	}
+	handle, err := startManagedHandle(ctx, func(ctx context.Context) {
+		defer c.supervisorNames.Delete(name)
 		c.run(ctx, name, task, onPanic)
 	})
+	if err != nil {
+		c.supervisorNames.Delete(name)
+	}
+	return handle, err
 }
 
 func (c *coordinator) run(ctx context.Context, name string, task uniqueTask, onPanic SupervisorPanicHandler) {

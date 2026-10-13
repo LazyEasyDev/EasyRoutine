@@ -20,8 +20,9 @@ task but only the process holding its SQL lease should run it.
 | `SafeGoWithCtx` | Run local work with an additional task-specific context |
 | `StartUniqueSupervisor` | Run persistent work while this process owns its lease |
 | `StartUniqueSupervisorWithCtx` | Run unique work with an additional task-specific context |
-| `GetSupervisorStatuses` | Read current supervisor state from SQL |
-| `GetSupervisorLogs` | Read retained acquire and release history from SQL |
+| `ListSupervisors` | Read lightweight stored states and retained history counts |
+| `GetSupervisorHistory` | Read one routine's retained acquire and release history |
+| `DeleteSupervisorRecords` | Remove stored state and history for a locally unused name |
 | `Handle` | Stop, wait for, or observe managed work |
 | `Close` | Request cancellation of all managed work without waiting |
 | `Wait` | Wait for all active handles in this process |
@@ -257,6 +258,12 @@ A supervisor name must:
 Names are exact identifiers. Case and UTF-8 byte representation are preserved,
 so every process must use the same name for the same task.
 
+Only one supervisor with a given name may be registered in this process. A
+duplicate start returns an error wrapping `ErrSupervisorRegistered`, including
+while the existing supervisor is waiting for a lease or recovering from a panic.
+The name becomes available after the supervisor and its cleanup finish. Other
+processes may register the same name and continue to coordinate through SQL.
+
 After a normal return, the supervisor retains its lease and starts the task
 again after the repeat delay. The delay starts only after the task returns;
 it does not launch overlapping attempts within one supervisor. A task that
@@ -389,52 +396,80 @@ retry policy. If a callback nevertheless calls it, managed work stops; a unique
 supervisor also stops renewal and attempts release. Return from the callback
 instead.
 
-## Status and History
+## Monitoring and Record Cleanup
 
-`GetSupervisorStatuses` and `GetSupervisorLogs` require successful `Initialize`
-with a SQL database. Their context arguments remain per-query contexts; queries
-can still run after `Close` if that context and the database remain active.
-These calls are not managed handles and are not tracked by `Wait`; callers must
-finish them separately before closing the database.
+`ListSupervisors`, `GetSupervisorHistory`, and `DeleteSupervisorRecords` require
+successful `Initialize` with a SQL database. Their contexts apply to the caller's
+operation; the operations can still run after `Close` if that context and the
+database remain active. They are not managed handles and are not tracked by
+`Wait`; callers must finish them separately before closing the database.
 
-With no names they return all records. Supplied names use the supervisor-name
-validation rules. Duplicate filters are removed and large filters are queried
-in bounded batches. An all-history `GetSupervisorLogs` call first discovers
-stored routine IDs, then uses the same bounded batches and groups the results
-by exact routine name.
+`ListSupervisors(ctx, names...)` returns a non-nil slice of `Supervisor` records
+ordered by exact name and routine ID. With no names it lists all stored states.
+Supplied names use the supervisor-name validation rules; duplicate filters are
+removed and large filters are queried in bounded batches.
+
+Each result contains `RoutineID`, `Name`, `Owner`, `Status`, `SuccessCount`,
+`FailureCount`, `ExpiresAt`, `UpdatedAt`, `LeaseActive`, `RetainedLogs`,
+`LatestPanicAt`, and `LogCounts`. `LogCounts` distinguishes `NotStarted`,
+`Running`, `Done`, `Panic`, and `Other`. The list does not read log text or panic
+stacks. Counts and the latest panic time describe retained history, not lifetime
+totals. A zero retained panic count does not prove the routine never panicked.
+The state and history summaries are separate reads, not an immutable snapshot.
+
+`LeaseActive` compares expiry with the database clock. `Owner` is the lease's
+random acquisition token, not a hostname. `ExpiresAt`, `UpdatedAt`,
+`LatestPanicAt`, and each history record's `CreatedAt` are signed Unix seconds.
+Released or expired state rows remain stored until explicitly deleted.
+
+`GetSupervisorHistory(ctx, routineID)` returns a non-nil slice of `SupervisorLog`
+for one lowercase SHA-256 routine ID returned by `ListSupervisors`. An absent
+history returns an empty slice. Results are ordered newest first by `CreatedAt`,
+then `ID` descending for records in the same second. Unknown stored status or
+action strings are preserved.
 
 ```go
-statuses, err := EasyRoutine.GetSupervisorStatuses(appCtx)
+supervisors, err := EasyRoutine.ListSupervisors(appCtx, "queue-consumer")
 if err != nil {
 	log.Fatal(err)
 }
-log.Printf("queue status: %+v", statuses["queue-consumer"])
-
-history, err := EasyRoutine.GetSupervisorLogs(appCtx, "queue-consumer", "billing")
-if err != nil {
-	log.Fatal(err)
+for _, supervisor := range supervisors {
+	log.Printf("queue status: %+v", supervisor)
+	history, err := EasyRoutine.GetSupervisorHistory(appCtx, supervisor.RoutineID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("queue history: %+v", history)
 }
-log.Printf("queue history: %+v", history["queue-consumer"])
-
-statusJSON, err := statuses.JSON()
-if err != nil {
-	log.Fatal(err)
-}
-log.Printf("statuses: %s", statusJSON)
 ```
 
-`GetSupervisorStatuses` returns `SupervisorStatuses`, a map from each exact routine name
-to its `SupervisorStatus`. `GetSupervisorLogs` returns `SupervisorHistory`, a map from
-each exact routine name to its retained log slice. Missing names are omitted,
-and empty results are non-nil empty maps. Each type has a `JSON` method that
-encodes the result as a JSON object; a nil value is encoded as `{}`. Map
-iteration order is unspecified.
+### Delete Stored Records
 
-A `SupervisorStatus` is a read-only snapshot of the `easy_rountine_unique` row; it
-does not control the supervisor lifecycle.
-`ExpiresAt`, `UpdatedAt`, and each log's `CreatedAt` are signed Unix seconds
-generated by the database clock. The row is retained after release or
-expiration, so it may describe a previous owner.
+`DeleteSupervisorRecords(ctx, name)` checks only the exact name's in-memory
+registration in this process. A registered name returns an error wrapping
+`ErrSupervisorRegistered` and containing the name. Otherwise the routine's
+stored state and all its history are deleted in one transaction. Missing state
+or history is a success, and orphan history is removed too.
+
+The name is reserved during deletion so a local supervisor cannot start until
+the operation finishes. No active-lease guard, automatic cancellation, or
+permanent disablement is performed. Other processes are not checked: they may
+still be running or waiting for this name, may write history concurrently, and
+may recreate the records. Use this for cleanup of names retired from your code,
+not to stop distributed work.
+
+```go
+if err := EasyRoutine.DeleteSupervisorRecords(appCtx, "retired-worker"); err != nil {
+	if errors.Is(err, EasyRoutine.ErrSupervisorRegistered) {
+		log.Printf("cannot delete: %v", err)
+	} else {
+		log.Printf("record cleanup failed: %v", err)
+	}
+}
+```
+
+This API replaces `GetSupervisorStatuses`, `GetSupervisorLogs`, and their
+map/JSON helper types. Use `encoding/json` directly when serialization is needed.
 
 `SuccessCount` and `FailureCount` belong to one in-process supervisor started by
 `StartUniqueSupervisor`. They persist if that same supervisor reacquires a
@@ -449,10 +484,8 @@ Current state is sampled during lease operations:
 | Renew | Latest sampled status, counters, and log | No |
 | Release | Final `RoutineDone` or `RoutinePanic` state | Yes |
 
-Each routine's history is ordered by `CreatedAt` from oldest to newest. Records
-with the same Unix second have unspecified relative order. The SQL backend
-retains the newest 25 records per routine ID. Panic release records include the
-recovered value and stack in `Log`. Every current-state and history `Log`
+The SQL backend retains the newest 25 records per routine ID. Panic release
+records include the recovered value and stack in `Log`. Every stored log
 starts with the process's operating system hostname in brackets; normal records
 contain only that prefix. If the hostname is unavailable, the prefix is
 `[unknown]`. History insertion and pruning are best effort. SQL errors from

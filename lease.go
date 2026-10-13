@@ -2,7 +2,6 @@ package EasyRoutine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -48,55 +47,16 @@ type leaseState struct {
 
 // SupervisorLog is a durable lifecycle event recorded by the SQL backend.
 type SupervisorLog struct {
-	ID     string
-	Name   string
-	Owner  string
-	Action LeaseAction
-	Status RoutineStatus
+	ID        string
+	RoutineID string
+	Name      string
+	Owner     string
+	Action    LeaseAction
+	Status    RoutineStatus
 	// Log starts with the server tag and contains panic details when applicable.
 	Log string
 	// CreatedAt is Unix time in seconds assigned by the provider's storage clock.
 	CreatedAt int64
-}
-
-// SupervisorStatus is the latest state stored for a uniquely supervised task.
-// Owner identifies the last process to hold the lease. ExpiresAt and UpdatedAt
-// are Unix times in seconds assigned by the database clock.
-type SupervisorStatus struct {
-	Name         string
-	Owner        string
-	Status       RoutineStatus
-	SuccessCount int64
-	FailureCount int64
-	// Log starts with the server tag and contains panic details when applicable.
-	Log       string
-	ExpiresAt int64
-	UpdatedAt int64
-}
-
-// SupervisorStatuses maps each exact routine name to its current state.
-type SupervisorStatuses map[string]SupervisorStatus
-
-// JSON returns the statuses encoded as a JSON object. A nil map is encoded as
-// an empty object.
-func (s SupervisorStatuses) JSON() ([]byte, error) {
-	if s == nil {
-		s = SupervisorStatuses{}
-	}
-	return json.Marshal(s)
-}
-
-// SupervisorHistory maps each exact routine name to its retained history.
-// Each history slice is ordered from oldest to newest.
-type SupervisorHistory map[string][]SupervisorLog
-
-// JSON returns the history encoded as a JSON object. A nil map is encoded as
-// an empty object.
-func (h SupervisorHistory) JSON() ([]byte, error) {
-	if h == nil {
-		h = SupervisorHistory{}
-	}
-	return json.Marshal(h)
 }
 
 func validateRoutineName(name string) error {
@@ -131,73 +91,11 @@ func validateRoutineName(name string) error {
 // when Owner no longer holds Name, including when no matching lease exists.
 // Methods must return promptly after ctx is canceled.
 // Action's result describes only the ownership change; log persistence must not
-// change a successful result to false. Query methods with no names return all
-// records. GetSupervisorLogs groups records by exact routine name and orders each history
-// from oldest to newest.
+// change a successful result to false. Listing excludes log text; history is
+// ordered newest first. Deletion atomically removes the state and all history.
 type leaseProvider interface {
 	Action(ctx context.Context, action LeaseAction, state leaseState) bool
-	GetSupervisorStatuses(ctx context.Context, names ...string) (SupervisorStatuses, error)
-	GetSupervisorLogs(ctx context.Context, names ...string) (SupervisorHistory, error)
-}
-
-// GetSupervisorStatuses returns current supervisor states keyed by exact routine name for
-// all tasks or only the supplied names.
-func GetSupervisorStatuses(ctx context.Context, names ...string) (statuses SupervisorStatuses, err error) {
-	if ctx == nil {
-		return nil, errors.New("context is required")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	for _, name := range names {
-		if err := validateRoutineName(name); err != nil {
-			return nil, err
-		}
-	}
-
-	lifecycleMu.RLock()
-	configured := defaultCoordinator
-	lifecycleMu.RUnlock()
-	if configured == nil {
-		return nil, errors.New("SQL lease is not initialized")
-	}
-
-	defer func() {
-		if recover() != nil {
-			statuses = nil
-			err = errors.New("lease provider panicked while getting statuses")
-		}
-	}()
-	return configured.backend.GetSupervisorStatuses(ctx, names...)
-}
-
-// GetSupervisorLogs returns retained supervisor logs grouped by exact routine name for
-// all names or only the supplied names. Each history is ordered oldest first.
-func GetSupervisorLogs(ctx context.Context, names ...string) (logs SupervisorHistory, err error) {
-	if ctx == nil {
-		return nil, errors.New("context is required")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	for _, name := range names {
-		if err := validateRoutineName(name); err != nil {
-			return nil, err
-		}
-	}
-
-	lifecycleMu.RLock()
-	configured := defaultCoordinator
-	lifecycleMu.RUnlock()
-	if configured == nil {
-		return nil, errors.New("SQL lease is not initialized")
-	}
-
-	defer func() {
-		if recover() != nil {
-			logs = nil
-			err = errors.New("lease provider panicked while getting logs")
-		}
-	}()
-	return configured.backend.GetSupervisorLogs(ctx, names...)
+	ListSupervisors(ctx context.Context, names ...string) ([]Supervisor, error)
+	GetSupervisorHistory(ctx context.Context, routineID string) ([]SupervisorLog, error)
+	DeleteSupervisorRecords(ctx context.Context, name string) error
 }
